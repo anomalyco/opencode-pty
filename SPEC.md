@@ -1,93 +1,81 @@
-# Graceful PTY Descriptor Handoff
+# Threaded PTY Service Core
 
-Status: proof of concept
+Status: threaded core and persistent service API implemented
 
-## Question
+## Objective
 
-Can a replacement server continue operating an interactive terminal whose PTY
-master was created by an older server process, while the terminal child remains
-alive throughout a coordinated restart?
+Prove that one Rust service can own multiple portable PTYs while each terminal
+uses isolated blocking threads, authoritative libghostty parsing, bounded raw
+replay, and explicit lifecycle state.
 
-## Hypothesis
+## Invariants
 
-On Linux and macOS, the old server can send its open PTY master descriptor to a
-replacement over a Unix-domain socket using `SCM_RIGHTS`. The kernel installs a
-new descriptor for the same open PTY master in the replacement. If the old
-server does not close its descriptor before the replacement adopts and
-acknowledges it, the slave side never observes the last master reference
-closing, so the child can continue to run.
+- One reader consumes each PTY output stream.
+- One writer serializes every byte written to each PTY.
+- libghostty state is created, accessed, and dropped on one actor thread.
+- libghostty callbacks never perform blocking PTY writes or IPC.
+- Actor and writer channels are bounded.
+- Raw replay is bounded and uses absolute byte offsets.
+- Replay truncation is explicit.
+- PTY resize and parser resize occur in one ordered actor command.
+- Child exit and PTY EOF are separate events.
+- One terminal exiting does not stop the service or another terminal.
+- Service shutdown attempts to terminate and join every terminal runtime.
+- A terminal has at most one controller; observers cannot write or resize.
+- Subscription replay and live events cross one ordered actor boundary.
+- Slow subscribers are disconnected without blocking terminal output.
+
+## Data Flow
 
 ```text
-Before:
-
-  old server -- PTY master <==> PTY slave -- fixture child
-
-During handoff:
-
-  old server -- PTY master
-                  |
-             SCM_RIGHTS
-                  |
-  new server -- PTY master <==> PTY slave -- fixture child
-
-After acknowledgment:
-
-  new server -- PTY master <==> PTY slave -- fixture child
+child PTY output
+  -> blocking reader thread
+  -> bounded actor queue
+  -> append bounded raw replay
+  -> libghostty vt_write
+  -> collect parser responses
+  -> bounded writer queue
+  -> blocking writer thread
+  -> child PTY input
 ```
 
-## Scope
+User input also enters through the actor and the same writer queue.
 
-The POC transfers one PTY during a graceful, cooperative restart. It proves
-continuity of the kernel PTY connection and bidirectional I/O.
+## Snapshot
 
-It does not attempt to preserve:
+A snapshot is built on the actor thread and contains owned values only:
 
-- WebSocket or application clients
-- JavaScript or server heap state
-- A terminal emulator framebuffer
-- Output history beyond a tiny POC buffer
-- Child-parent ownership or portable exit-status reaping
-- Terminals after an old-server crash before transfer
-- Terminals after machine reboot
-- Windows ConPTY handles
+- Terminal metadata and lifecycle
+- Rows and columns
+- Cursor position
+- Plain parsed screen text
+- VT checkpoint synthesized by libghostty formatter
+- Raw replay head and tail offsets
 
-## Success Criteria
+No borrowed libghostty object crosses a thread boundary.
 
-- The same fixture-child PID is reported before and after handoff.
-- The old server receives a response to input sent before handoff.
-- The replacement receives a response to input sent after handoff.
-- There is no interval where every PTY master descriptor is closed.
-- The old server closes its descriptor only after receiver acknowledgment.
-- A failed handoff leaves the old server able to clean up the child.
-- The demonstration exits without leaked processes or socket files.
+## Failure Boundary
 
-## Handoff Protocol
+The persistent `opencode-pty` process survives OpenCode server and client
+restarts. If `opencode-pty` itself dies, its terminals may die. That is an
+accepted boundary and this project does not implement live PTY handoff.
 
-1. Old server creates the PTY and fixture child.
-2. Old server starts receiver with a unique Unix socket path.
-3. Receiver binds/listens and reports readiness.
-4. Old server pauses PTY reads and client writes.
-5. Old server sends protocol metadata plus exactly one descriptor.
-6. Receiver validates metadata and descriptor count.
-7. Receiver configures and registers the PTY descriptor.
-8. Receiver sends an acknowledgment.
-9. Old server closes its copy and exits.
-10. Receiver resumes I/O and completes the post-handoff check.
+## Persistent Service Boundary
 
-Output produced while neither side reads remains in the kernel PTY queue. Both
-servers must never read concurrently because duplicated descriptors share that
-queue.
+The CLI ensures one detached `opencode-pty` process through a private service
+registration and authenticated Unix socket. The process owns the registry and
+terminal threads. CLI exit does not affect terminal lifetime.
 
-## Platform Notes
+The protocol is four-byte big-endian length followed by bounded UTF-8 JSON. It
+currently supports ping, create, list, write, resize, snapshot, replay,
+replay-to-live subscriptions, controller takeover, terminate, and destructive
+service shutdown.
 
-Linux and macOS both support Unix-domain sockets and `SCM_RIGHTS` descriptor
-passing. Process monitoring differs: Linux has `pidfd`; macOS does not. This POC
-does not solve transferable process-parent ownership and should not expand into
-that problem unless required to make cleanup deterministic.
+Registration is written atomically with private permissions and contains an
+instance ID, PID, protocol version, socket path, and random credential. A
+service lock elects one process and protects stale socket cleanup.
 
-## Decision After The POC
-
-If this succeeds, compare descriptor handoff with a long-lived terminal broker.
-The POC should provide evidence about implementation difficulty, handoff races,
-native API requirements, and cross-platform behavior. It should not be treated
-as a decision to use handoff in production.
+OpenCode chooses a database-keyed runtime directory before spawning the daemon,
+so servers using the same database reconnect to one PTY service while different
+databases elect independent services. OpenCode starts the daemon only when the
+first terminal is created.
