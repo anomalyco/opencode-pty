@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -21,6 +22,9 @@ const DEFAULT_ROWS: u16 = 30;
 const REPLAY_CAPACITY: usize = 2 * 1024 * 1024;
 const ACTOR_QUEUE_CAPACITY: usize = 128;
 const WRITER_QUEUE_CAPACITY: usize = 128;
+const SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
+const OUTPUT_BATCH_BYTES: usize = 8 * 1024;
+const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(1);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 pub type TerminalId = u64;
@@ -77,6 +81,7 @@ pub enum StreamEvent {
         cols: u16,
         rows: u16,
         generation: u64,
+        checkpoint: Vec<u8>,
     },
     Exited {
         exit_code: Option<u32>,
@@ -234,6 +239,44 @@ impl TerminalService {
             attachment_id,
             cols,
             rows,
+            reply,
+        })
+    }
+
+    pub fn control(
+        &self,
+        id: TerminalId,
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        validate_size(cols, rows)?;
+        self.get(id)?.request(|reply| ActorMessage::Control {
+            attachment_id,
+            cols,
+            rows,
+            bytes: None,
+            reply,
+        })
+    }
+
+    pub fn input(
+        &self,
+        id: TerminalId,
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        validate_size(cols, rows)?;
+        if bytes.len() > MAX_INPUT_BYTES {
+            bail!("input exceeds {MAX_INPUT_BYTES} byte limit");
+        }
+        self.get(id)?.request(|reply| ActorMessage::Control {
+            attachment_id,
+            cols,
+            rows,
+            bytes: Some(bytes),
             reply,
         })
     }
@@ -536,6 +579,13 @@ enum ActorMessage {
         rows: u16,
         reply: std_mpsc::SyncSender<Result<()>>,
     },
+    Control {
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+        bytes: Option<Vec<u8>>,
+        reply: std_mpsc::SyncSender<Result<()>>,
+    },
     Snapshot {
         reply: std_mpsc::SyncSender<Result<TerminalSnapshot>>,
     },
@@ -564,6 +614,8 @@ struct Attached {
 
 struct Subscriber {
     events: Sender<StreamEvent>,
+    role: AttachmentRole,
+    last_control: u64,
 }
 
 enum WriterMessage {
@@ -610,10 +662,11 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     let mut child_exit = None::<std::result::Result<Option<u32>, String>>;
     let mut reader_eof = false;
     let mut exit_published = false;
+    let mut pending_message = None;
     let _ = init_tx.send(Ok(()));
 
     loop {
-        match messages.recv() {
+        match receive_actor_message(&messages, &mut pending_message) {
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
@@ -663,6 +716,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         value.rows = rows;
                     }
                     let generation = controller_generation;
+                    let checkpoint = format_terminal(&terminal, Format::Vt)?.into_bytes();
                     broadcast(
                         &mut subscribers,
                         &mut controller,
@@ -671,8 +725,82 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                             cols,
                             rows,
                             generation,
+                            checkpoint,
                         },
                     );
+                    Ok(())
+                })();
+                let _ = reply.send(result);
+            }
+            Ok(ActorMessage::Control {
+                attachment_id,
+                cols,
+                rows,
+                bytes,
+                reply,
+            }) => {
+                let result = (|| {
+                    if !subscribers.contains_key(&attachment_id) {
+                        bail!("attachment {attachment_id} is not subscribed");
+                    }
+                    if controller.as_ref() != Some(&attachment_id) {
+                        if let Some(current) = controller.as_ref()
+                            && let Some(subscriber) = subscribers.get_mut(current)
+                        {
+                            subscriber.role = AttachmentRole::Observer;
+                        }
+                        controller_generation = controller_generation.saturating_add(1);
+                        controller = Some(attachment_id.clone());
+                        if let Some(subscriber) = subscribers.get_mut(&attachment_id) {
+                            subscriber.role = AttachmentRole::Controller;
+                            subscriber.last_control = controller_generation;
+                        }
+                        let generation = controller_generation;
+                        broadcast(
+                            &mut subscribers,
+                            &mut controller,
+                            &mut controller_generation,
+                            StreamEvent::ControllerChanged {
+                                attachment_id: Some(attachment_id.clone()),
+                                generation,
+                            },
+                        );
+                    }
+                    let changed = info
+                        .read()
+                        .map(|value| value.cols != cols || value.rows != rows)
+                        .unwrap_or(true);
+                    if changed {
+                        master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })?;
+                        terminal.resize(cols, rows, 0, 0)?;
+                        if let Ok(mut value) = info.write() {
+                            value.cols = cols;
+                            value.rows = rows;
+                        }
+                        let generation = controller_generation;
+                        let checkpoint = format_terminal(&terminal, Format::Vt)?.into_bytes();
+                        broadcast(
+                            &mut subscribers,
+                            &mut controller,
+                            &mut controller_generation,
+                            StreamEvent::Resized {
+                                cols,
+                                rows,
+                                generation,
+                                checkpoint,
+                            },
+                        );
+                    }
+                    if let Some(bytes) = bytes {
+                        writes
+                            .send(WriterMessage::Bytes(bytes))
+                            .map_err(|_| anyhow!("terminal writer stopped"))?;
+                    }
                     Ok(())
                 })();
                 let _ = reply.send(result);
@@ -696,8 +824,10 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                             if current != &attachment_id && !takeover {
                                 bail!("terminal already has controller {current}");
                             }
-                            if current != &attachment_id {
-                                subscribers.remove(current);
+                            if current != &attachment_id
+                                && let Some(subscriber) = subscribers.get_mut(current)
+                            {
+                                subscriber.role = AttachmentRole::Observer;
                             }
                         }
                         if controller.as_ref() != Some(&attachment_id) {
@@ -706,8 +836,19 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         }
                     }
                     let replay = replay.read_from(offset)?;
-                    let (events_tx, events) = bounded(64);
-                    subscribers.insert(attachment_id.clone(), Subscriber { events: events_tx });
+                    let (events_tx, events) = bounded(SUBSCRIBER_QUEUE_CAPACITY);
+                    subscribers.insert(
+                        attachment_id.clone(),
+                        Subscriber {
+                            events: events_tx,
+                            role,
+                            last_control: if role == AttachmentRole::Controller {
+                                controller_generation
+                            } else {
+                                0
+                            },
+                        },
+                    );
                     if role == AttachmentRole::Controller {
                         let controller_id = controller.clone();
                         let generation = controller_generation;
@@ -732,15 +873,16 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Ok(ActorMessage::Detach { attachment_id }) => {
                 let removed = subscribers.remove(&attachment_id);
                 if removed.is_some() && controller.as_ref() == Some(&attachment_id) {
-                    controller = None;
                     controller_generation = controller_generation.saturating_add(1);
+                    controller = promote_latest(&mut subscribers, controller_generation);
                     let generation = controller_generation;
+                    let attachment_id = controller.clone();
                     broadcast(
                         &mut subscribers,
                         &mut controller,
                         &mut controller_generation,
                         StreamEvent::ControllerChanged {
-                            attachment_id: None,
+                            attachment_id,
                             generation,
                         },
                     );
@@ -784,6 +926,32 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     drop(master);
     drop(writes);
     Ok(())
+}
+
+fn receive_actor_message(
+    messages: &Receiver<ActorMessage>,
+    pending: &mut Option<ActorMessage>,
+) -> std::result::Result<ActorMessage, crossbeam_channel::RecvError> {
+    let message = match pending.take() {
+        Some(message) => message,
+        None => messages.recv()?,
+    };
+    let ActorMessage::Output(mut bytes) = message else {
+        return Ok(message);
+    };
+    let deadline = Instant::now() + OUTPUT_BATCH_DELAY;
+    while bytes.len() < OUTPUT_BATCH_BYTES {
+        match messages.recv_deadline(deadline) {
+            Ok(ActorMessage::Output(next)) => bytes.extend(next),
+            Ok(message) => {
+                *pending = Some(message);
+                break;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(ActorMessage::Output(bytes))
 }
 
 fn run_writer(
@@ -908,20 +1076,47 @@ fn broadcast(
 ) {
     let dropped = subscribers
         .iter()
-        .filter_map(
-            |(id, subscriber)| match subscriber.events.try_send(event.clone()) {
-                Ok(()) => None,
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => Some(id.clone()),
-            },
-        )
+        .filter_map(|(id, subscriber)| {
+            let failed = match subscriber.role {
+                AttachmentRole::Controller => subscriber.events.send(event.clone()).is_err(),
+                AttachmentRole::Observer => subscriber.events.try_send(event.clone()).is_err(),
+            };
+            failed.then(|| id.clone())
+        })
         .collect::<Vec<_>>();
     for id in dropped {
         subscribers.remove(&id);
         if controller.as_ref() == Some(&id) {
-            *controller = None;
             *controller_generation = controller_generation.saturating_add(1);
+            *controller = promote_latest(subscribers, *controller_generation);
+            let generation = *controller_generation;
+            let attachment_id = controller.clone();
+            broadcast(
+                subscribers,
+                controller,
+                controller_generation,
+                StreamEvent::ControllerChanged {
+                    attachment_id,
+                    generation,
+                },
+            );
         }
     }
+}
+
+fn promote_latest(
+    subscribers: &mut HashMap<String, Subscriber>,
+    generation: u64,
+) -> Option<String> {
+    let attachment_id = subscribers
+        .iter()
+        .max_by_key(|(_, subscriber)| subscriber.last_control)
+        .map(|(attachment_id, _)| attachment_id.clone())?;
+    if let Some(subscriber) = subscribers.get_mut(&attachment_id) {
+        subscriber.role = AttachmentRole::Controller;
+        subscriber.last_control = generation;
+    }
+    Some(attachment_id)
 }
 
 fn authorize_controller(controller: &Option<String>, attachment_id: Option<&str>) -> Result<()> {
@@ -974,5 +1169,105 @@ mod tests {
         let value = replay.read_from(5).unwrap();
         assert!(!value.truncated);
         assert_eq!(value.bytes, b"fg");
+    }
+
+    #[test]
+    fn controller_backpressures_instead_of_disconnecting() {
+        let (events_tx, events) = bounded(1);
+        events_tx
+            .send(StreamEvent::Output {
+                start: 0,
+                end: 1,
+                bytes: b"a".to_vec(),
+            })
+            .unwrap();
+        let mut subscribers = HashMap::from([(
+            "controller".to_string(),
+            Subscriber {
+                events: events_tx,
+                role: AttachmentRole::Controller,
+                last_control: 1,
+            },
+        )]);
+        let broadcast = std::thread::spawn(move || {
+            let mut controller = Some("controller".to_string());
+            let mut generation = 1;
+            broadcast(
+                &mut subscribers,
+                &mut controller,
+                &mut generation,
+                StreamEvent::Output {
+                    start: 1,
+                    end: 2,
+                    bytes: b"b".to_vec(),
+                },
+            );
+            subscribers.contains_key("controller")
+        });
+
+        assert!(matches!(
+            events.recv().unwrap(),
+            StreamEvent::Output { start: 0, .. }
+        ));
+        assert!(matches!(
+            events.recv().unwrap(),
+            StreamEvent::Output { start: 1, .. }
+        ));
+        assert!(broadcast.join().unwrap());
+    }
+
+    #[test]
+    fn slow_observer_is_disconnected() {
+        let (events_tx, _events) = bounded(1);
+        events_tx
+            .send(StreamEvent::Output {
+                start: 0,
+                end: 1,
+                bytes: b"a".to_vec(),
+            })
+            .unwrap();
+        let mut subscribers = HashMap::from([(
+            "observer".to_string(),
+            Subscriber {
+                events: events_tx,
+                role: AttachmentRole::Observer,
+                last_control: 0,
+            },
+        )]);
+
+        broadcast(
+            &mut subscribers,
+            &mut None,
+            &mut 0,
+            StreamEvent::Output {
+                start: 1,
+                end: 2,
+                bytes: b"b".to_vec(),
+            },
+        );
+
+        assert!(!subscribers.contains_key("observer"));
+    }
+
+    #[test]
+    fn output_is_batched_without_reordering_other_messages() {
+        let (messages_tx, messages) = bounded(4);
+        messages_tx
+            .send(ActorMessage::Output(b"abc".to_vec()))
+            .unwrap();
+        messages_tx
+            .send(ActorMessage::Output(b"def".to_vec()))
+            .unwrap();
+        messages_tx.send(ActorMessage::Shutdown).unwrap();
+        let mut pending = None;
+
+        assert!(matches!(
+            receive_actor_message(&messages, &mut pending).unwrap(),
+            ActorMessage::Output(bytes) if bytes == b"abcdef"
+        ));
+        assert!(matches!(
+            receive_actor_message(&messages, &mut pending).unwrap(),
+            ActorMessage::Shutdown
+        ));
     }
 }

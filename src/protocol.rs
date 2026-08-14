@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::service::{TerminalId, TerminalInfo};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const OUTPUT_FRAME_TAG: u8 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +48,19 @@ pub enum Request {
         attachment_id: Option<String>,
         cols: u16,
         rows: u16,
+    },
+    Control {
+        id: TerminalId,
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Input {
+        id: TerminalId,
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+        data_base64: String,
     },
     Snapshot {
         id: TerminalId,
@@ -107,15 +121,11 @@ pub enum Response {
         truncated: bool,
         replay_base64: String,
     },
-    Output {
-        start: u64,
-        end: u64,
-        data_base64: String,
-    },
     Resized {
         cols: u16,
         rows: u16,
         generation: u64,
+        checkpoint_base64: String,
     },
     Exited {
         exit_code: Option<u32>,
@@ -142,7 +152,61 @@ pub fn write_frame(mut writer: impl Write, value: &impl Serialize) -> Result<()>
     Ok(())
 }
 
+pub fn write_output_frame(
+    mut writer: impl Write,
+    start: u64,
+    end: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let payload_len = bytes
+        .len()
+        .checked_add(17)
+        .context("output frame length overflow")?;
+    if payload_len > MAX_FRAME_BYTES {
+        bail!("frame exceeds {MAX_FRAME_BYTES} byte limit");
+    }
+    let length = u32::try_from(payload_len).context("frame length exceeds u32")?;
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(&[OUTPUT_FRAME_TAG])?;
+    writer.write_all(&start.to_be_bytes())?;
+    writer.write_all(&end.to_be_bytes())?;
+    writer.write_all(bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum SubscriptionEvent {
+    Output {
+        start: u64,
+        end: u64,
+        bytes: Vec<u8>,
+    },
+    Response(Response),
+}
+
+pub fn read_subscription_event(mut reader: impl Read) -> Result<SubscriptionEvent> {
+    let payload = read_payload(&mut reader)?;
+    if payload.first() != Some(&OUTPUT_FRAME_TAG) {
+        return serde_json::from_slice(&payload)
+            .map(SubscriptionEvent::Response)
+            .context("invalid protocol JSON");
+    }
+    if payload.len() < 17 {
+        bail!("invalid output frame");
+    }
+    Ok(SubscriptionEvent::Output {
+        start: u64::from_be_bytes(payload[1..9].try_into().expect("fixed start offset")),
+        end: u64::from_be_bytes(payload[9..17].try_into().expect("fixed end offset")),
+        bytes: payload[17..].to_vec(),
+    })
+}
+
 pub fn read_frame<T: for<'de> Deserialize<'de>>(mut reader: impl Read) -> Result<T> {
+    serde_json::from_slice(&read_payload(&mut reader)?).context("invalid protocol JSON")
+}
+
+fn read_payload(mut reader: impl Read) -> Result<Vec<u8>> {
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -151,5 +215,5 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(mut reader: impl Read) -> Result
     }
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload).context("invalid protocol JSON")
+    Ok(payload)
 }

@@ -18,12 +18,16 @@ replay, and explicit lifecycle state.
 - Raw replay is bounded and uses absolute byte offsets.
 - Replay truncation is explicit.
 - PTY resize and parser resize occur in one ordered actor command.
+- Every resize publishes an authoritative post-resize VT checkpoint before subsequent output.
 - Child exit and PTY EOF are separate events.
 - One terminal exiting does not stop the service or another terminal.
 - Service shutdown attempts to terminate and join every terminal runtime.
-- A terminal has at most one controller; observers cannot write or resize.
+- A terminal has at most one controller; observers cannot write or resize until interaction promotes them.
+- Promotion demotes the previous controller without closing its subscription.
+- Promotion, canonical resize, and input are one ordered actor command.
 - Subscription replay and live events cross one ordered actor boundary.
-- Slow subscribers are disconnected without blocking terminal output.
+- Controller delivery applies backpressure; observers tolerate bounded output bursts and are disconnected when their backlog remains full.
+- Adjacent output is coalesced before fanout, flushing at 8 KiB, after 1 ms, or before the next non-output event.
 
 ## Data Flow
 
@@ -66,10 +70,11 @@ The CLI ensures one detached `opencode-pty` process through a private service
 registration and authenticated Unix socket. The process owns the registry and
 terminal threads. CLI exit does not affect terminal lifetime.
 
-The protocol is four-byte big-endian length followed by bounded UTF-8 JSON. It
-currently supports ping, create, list, write, resize, snapshot, replay,
-replay-to-live subscriptions, controller takeover, terminate, and destructive
-service shutdown.
+Protocol v4 uses four-byte big-endian framing with bounded UTF-8 JSON control
+frames and tagged raw binary output frames. It supports ping, create, list,
+write, resize, atomic interaction promotion, snapshot, replay, replay-to-live
+subscriptions, controller takeover, terminate, and destructive service
+shutdown.
 
 Registration is written atomically with private permissions and contains an
 instance ID, PID, protocol version, socket path, and random credential. A

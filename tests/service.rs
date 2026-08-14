@@ -95,7 +95,52 @@ fn hidden_terminal_output_uses_bounded_replay() {
 }
 
 #[test]
-fn controller_is_exclusive_and_observer_receives_live_output() {
+fn bursty_output_does_not_disconnect_a_healthy_observer() {
+    let service = TerminalService::new(2 * 1024 * 1024);
+    let terminal = service
+        .create(command("sleep 0.05; head -c 1048576 /dev/zero; sleep 0.2"))
+        .expect("terminal created");
+    let observer = service
+        .attach(
+            terminal.id,
+            0,
+            "observer".to_string(),
+            AttachmentRole::Observer,
+            false,
+        )
+        .expect("observer attached");
+
+    wait_for(|| {
+        service.list().is_ok_and(|items| {
+            items
+                .iter()
+                .any(|item| item.id == terminal.id && item.output_tail >= 1024 * 1024)
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut received = 0;
+    let mut output_events = 0;
+    while received < 1024 * 1024 && Instant::now() < deadline {
+        match observer.events.recv_timeout(Duration::from_millis(50)) {
+            Ok(StreamEvent::Output { bytes, .. }) => {
+                received += bytes.len();
+                output_events += 1;
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert_eq!(received, 1024 * 1024);
+    assert!(
+        output_events <= 256,
+        "received {output_events} output events"
+    );
+
+    service.terminate(terminal.id).expect("terminal removed");
+}
+
+#[test]
+fn controller_switches_without_disconnecting_observers() {
     let service = TerminalService::new(64 * 1024);
     let terminal = service
         .create(command("sleep 0.05; printf 'streamed\\n'; sleep 0.2"))
@@ -172,5 +217,46 @@ fn controller_is_exclusive_and_observer_receives_live_output() {
         )
         .expect("controller takeover");
     assert!(takeover.generation > controller.generation);
+    assert!(
+        service
+            .write_for(
+                terminal.id,
+                Some("controller-a".to_string()),
+                b"not allowed".to_vec(),
+            )
+            .is_err()
+    );
+    service
+        .input(
+            terminal.id,
+            "controller-a".to_string(),
+            91,
+            26,
+            b"reclaimed\n".to_vec(),
+        )
+        .expect("former controller reclaims control and writes");
+    assert!(
+        service
+            .write_for(
+                terminal.id,
+                Some("controller-b".to_string()),
+                b"not allowed".to_vec(),
+            )
+            .is_err()
+    );
+    service
+        .control(terminal.id, "observer".to_string(), 92, 27)
+        .expect("observer claims control");
+    service
+        .control(terminal.id, "controller-b".to_string(), 93, 28)
+        .expect("takeover controller remains subscribed");
+    drop(takeover);
+    service
+        .write_for(
+            terminal.id,
+            Some("observer".to_string()),
+            b"fallback\n".to_vec(),
+        )
+        .expect("latest remaining controller is promoted on detach");
     service.terminate(terminal.id).expect("terminal removed");
 }

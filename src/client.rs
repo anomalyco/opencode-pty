@@ -9,7 +9,8 @@ use base64::Engine;
 
 use crate::daemon::{Registration, read_registration};
 use crate::protocol::{
-    AttachmentRole, Envelope, PROTOCOL_VERSION, Request, Response, read_frame, write_frame,
+    AttachmentRole, Envelope, PROTOCOL_VERSION, Request, Response, SubscriptionEvent, read_frame,
+    read_subscription_event, write_frame,
 };
 use crate::service::{CreateTerminal, TerminalId, TerminalInfo};
 
@@ -48,8 +49,8 @@ pub struct TerminalSubscription {
 
 #[cfg(unix)]
 impl TerminalSubscription {
-    pub fn next_event(&mut self) -> Result<Response> {
-        read_frame(&mut self.stream)
+    pub fn next_event(&mut self) -> Result<SubscriptionEvent> {
+        read_subscription_event(&mut self.stream)
     }
 }
 
@@ -151,6 +152,38 @@ impl TerminalClient {
             attachment_id,
             cols,
             rows,
+        })
+    }
+
+    pub fn control(
+        &self,
+        id: TerminalId,
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.expect_ok(Request::Control {
+            id,
+            attachment_id,
+            cols,
+            rows,
+        })
+    }
+
+    pub fn input(
+        &self,
+        id: TerminalId,
+        attachment_id: String,
+        cols: u16,
+        rows: u16,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.expect_ok(Request::Input {
+            id,
+            attachment_id,
+            cols,
+            rows,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
         })
     }
 
@@ -383,19 +416,20 @@ fn watch(id: TerminalId) -> Result<()> {
     io::stdout().flush()?;
     loop {
         match subscription.next_event()? {
-            Response::Output { data_base64, .. } => {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(data_base64)?;
+            SubscriptionEvent::Output { bytes, .. } => {
                 io::stdout().write_all(&bytes)?;
                 io::stdout().flush()?;
             }
-            Response::Exited { exit_code, .. } => {
+            SubscriptionEvent::Response(Response::Exited { exit_code, .. }) => {
                 eprintln!("\nterminal exited: {exit_code:?}");
                 return Ok(());
             }
-            Response::Resized { cols, rows, .. } => eprintln!("\nterminal resized: {cols}x{rows}"),
-            Response::ControllerChanged { .. } => {}
-            Response::Error { message } => bail!(message),
-            response => bail!("unexpected stream response: {response:?}"),
+            SubscriptionEvent::Response(Response::Resized { cols, rows, .. }) => {
+                eprintln!("\nterminal resized: {cols}x{rows}")
+            }
+            SubscriptionEvent::Response(Response::ControllerChanged { .. }) => {}
+            SubscriptionEvent::Response(Response::Error { message }) => bail!(message),
+            event => bail!("unexpected stream event: {event:?}"),
         }
     }
 }

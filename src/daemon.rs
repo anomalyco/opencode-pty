@@ -31,7 +31,9 @@ mod unix {
     use fs2::FileExt;
 
     use super::{LOCK_FILE, REGISTRATION_FILE, Registration, SOCKET_FILE};
-    use crate::protocol::{Envelope, PROTOCOL_VERSION, Request, Response, read_frame, write_frame};
+    use crate::protocol::{
+        Envelope, PROTOCOL_VERSION, Request, Response, read_frame, write_frame, write_output_frame,
+    };
     use crate::service::{CreateTerminal, StreamEvent, TerminalService};
 
     pub fn service_dir() -> PathBuf {
@@ -230,19 +232,20 @@ mod unix {
                 default(Duration::from_millis(100)) => continue,
             };
             let response = match event {
-                StreamEvent::Output { start, end, bytes } => Response::Output {
-                    start,
-                    end,
-                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                },
+                StreamEvent::Output { start, end, bytes } => {
+                    write_output_frame(&mut *stream, start, end, &bytes)?;
+                    continue;
+                }
                 StreamEvent::Resized {
                     cols,
                     rows,
                     generation,
+                    checkpoint,
                 } => Response::Resized {
                     cols,
                     rows,
                     generation,
+                    checkpoint_base64: base64::engine::general_purpose::STANDARD.encode(checkpoint),
                 },
                 StreamEvent::Exited {
                     exit_code,
@@ -323,6 +326,28 @@ mod unix {
                 rows,
             } => {
                 service.resize_for(id, attachment_id, cols, rows)?;
+                Response::Ok
+            }
+            Request::Control {
+                id,
+                attachment_id,
+                cols,
+                rows,
+            } => {
+                service.control(id, attachment_id, cols, rows)?;
+                Response::Ok
+            }
+            Request::Input {
+                id,
+                attachment_id,
+                cols,
+                rows,
+                data_base64,
+            } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data_base64)
+                    .context("invalid input base64")?;
+                service.input(id, attachment_id, cols, rows, bytes)?;
                 Response::Ok
             }
             Request::Snapshot { id } => {
