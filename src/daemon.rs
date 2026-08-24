@@ -261,6 +261,10 @@ mod unix {
                     attachment_id,
                     generation,
                 },
+                StreamEvent::TitleChanged { title } => Response::TitleChanged { title },
+                StreamEvent::ForegroundProcessChanged { process } => {
+                    Response::ForegroundProcessChanged { process }
+                }
             };
             write_frame(&mut *stream, &response)?;
             if matches!(response, Response::Exited { .. }) {

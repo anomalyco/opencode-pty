@@ -420,16 +420,20 @@ fn watch(id: TerminalId) -> Result<()> {
                 io::stdout().write_all(&bytes)?;
                 io::stdout().flush()?;
             }
-            SubscriptionEvent::Response(Response::Exited { exit_code, .. }) => {
-                eprintln!("\nterminal exited: {exit_code:?}");
-                return Ok(());
-            }
-            SubscriptionEvent::Response(Response::Resized { cols, rows, .. }) => {
-                eprintln!("\nterminal resized: {cols}x{rows}")
-            }
-            SubscriptionEvent::Response(Response::ControllerChanged { .. }) => {}
-            SubscriptionEvent::Response(Response::Error { message }) => bail!(message),
-            event => bail!("unexpected stream event: {event:?}"),
+            SubscriptionEvent::Response(response) => match *response {
+                Response::Exited { exit_code, .. } => {
+                    eprintln!("\nterminal exited: {exit_code:?}");
+                    return Ok(());
+                }
+                Response::Resized { cols, rows, .. } => {
+                    eprintln!("\nterminal resized: {cols}x{rows}")
+                }
+                Response::ControllerChanged { .. }
+                | Response::TitleChanged { .. }
+                | Response::ForegroundProcessChanged { .. } => {}
+                Response::Error { message } => bail!(message),
+                response => bail!("unexpected stream response: {response:?}"),
+            },
         }
     }
 }

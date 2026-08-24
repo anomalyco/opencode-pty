@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ const WRITER_QUEUE_CAPACITY: usize = 128;
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
 const OUTPUT_BATCH_BYTES: usize = 8 * 1024;
 const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(1);
+const FOREGROUND_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 pub type TerminalId = u64;
@@ -42,6 +43,7 @@ pub struct TerminalInfo {
     pub id: TerminalId,
     pub pid: Option<u32>,
     pub title: String,
+    pub foreground_process: Option<String>,
     pub group_id: String,
     pub command: Vec<String>,
     pub cwd: PathBuf,
@@ -90,6 +92,12 @@ pub enum StreamEvent {
     ControllerChanged {
         attachment_id: Option<String>,
         generation: u64,
+    },
+    TitleChanged {
+        title: String,
+    },
+    ForegroundProcessChanged {
+        process: Option<String>,
     },
 }
 
@@ -411,6 +419,7 @@ impl TerminalHandle {
             id,
             pid,
             title: request.title,
+            foreground_process: None,
             group_id: request.group_id,
             command: std::iter::once(request.program)
                 .chain(request.args)
@@ -645,6 +654,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
         init_tx,
     } = config;
     let responses = Rc::new(RefCell::new(VecDeque::<Vec<u8>>::new()));
+    let title = Rc::new(RefCell::new(None::<String>));
     let mut terminal = Terminal::new(TerminalOptions {
         cols,
         rows,
@@ -653,6 +663,14 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     terminal.on_pty_write({
         let responses = Rc::clone(&responses);
         move |_terminal, data| responses.borrow_mut().push_back(data.to_vec())
+    })?;
+    terminal.on_title_changed({
+        let title = Rc::clone(&title);
+        move |terminal| {
+            if let Ok(value) = terminal.title() {
+                *title.borrow_mut() = Some(value.to_owned());
+            }
+        }
     })?;
 
     let mut replay = ReplayBuffer::new(replay_capacity);
@@ -663,10 +681,25 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     let mut reader_eof = false;
     let mut exit_published = false;
     let mut pending_message = None;
+    let mut next_foreground_process_poll = Instant::now();
     let _ = init_tx.send(Ok(()));
 
     loop {
-        match receive_actor_message(&messages, &mut pending_message) {
+        if Instant::now() >= next_foreground_process_poll {
+            publish_foreground_process(
+                &*master,
+                &info,
+                &mut subscribers,
+                &mut controller,
+                &mut controller_generation,
+            );
+            next_foreground_process_poll = Instant::now() + FOREGROUND_PROCESS_POLL_INTERVAL;
+        }
+        match receive_actor_message(
+            &messages,
+            &mut pending_message,
+            next_foreground_process_poll.saturating_duration_since(Instant::now()),
+        ) {
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
@@ -682,6 +715,26 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     &mut controller_generation,
                     StreamEvent::Output { start, end, bytes },
                 );
+                if let Some(title) = title.borrow_mut().take() {
+                    let changed = if let Ok(mut value) = info.write() {
+                        if value.title == title {
+                            false
+                        } else {
+                            value.title = title.clone();
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if changed {
+                        broadcast(
+                            &mut subscribers,
+                            &mut controller,
+                            &mut controller_generation,
+                            StreamEvent::TitleChanged { title },
+                        );
+                    }
+                }
             }
             Ok(ActorMessage::Write {
                 attachment_id,
@@ -897,7 +950,10 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                 }
             }
             Ok(ActorMessage::ReaderEof) => reader_eof = true,
-            Ok(ActorMessage::Shutdown) | Err(_) => break,
+            Ok(ActorMessage::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
         }
         if reader_eof
             && !exit_published
@@ -931,10 +987,11 @@ fn run_actor(config: ActorConfig) -> Result<()> {
 fn receive_actor_message(
     messages: &Receiver<ActorMessage>,
     pending: &mut Option<ActorMessage>,
-) -> std::result::Result<ActorMessage, crossbeam_channel::RecvError> {
+    timeout: Duration,
+) -> std::result::Result<ActorMessage, crossbeam_channel::RecvTimeoutError> {
     let message = match pending.take() {
         Some(message) => message,
-        None => messages.recv()?,
+        None => messages.recv_timeout(timeout)?,
     };
     let ActorMessage::Output(mut bytes) = message else {
         return Ok(message);
@@ -952,6 +1009,119 @@ fn receive_actor_message(
         }
     }
     Ok(ActorMessage::Output(bytes))
+}
+
+fn publish_foreground_process(
+    master: &dyn MasterPty,
+    info: &Arc<RwLock<TerminalInfo>>,
+    subscribers: &mut HashMap<String, Subscriber>,
+    controller: &mut Option<String>,
+    controller_generation: &mut u64,
+) {
+    let process = foreground_process(master);
+    let changed = if let Ok(mut value) = info.write() {
+        if value.foreground_process == process {
+            false
+        } else {
+            value.foreground_process = process.clone();
+            true
+        }
+    } else {
+        false
+    };
+    if changed {
+        broadcast(
+            subscribers,
+            controller,
+            controller_generation,
+            StreamEvent::ForegroundProcessChanged { process },
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn foreground_process(master: &dyn MasterPty) -> Option<String> {
+    let foreground_group = master.process_group_leader()?;
+    let tty = master.tty_name();
+    let processes = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(read_process)
+        .collect::<Vec<_>>();
+    let parents = processes
+        .iter()
+        .map(|process| (process.pid, process.ppid))
+        .collect::<HashMap<_, _>>();
+    let mut group = processes
+        .iter()
+        .filter(|process| process.pgrp == foreground_group)
+        .collect::<Vec<_>>();
+    if let Some(tty) = tty {
+        let attached = group
+            .iter()
+            .copied()
+            .filter(|process| process_attached_to_tty(process.pid, &tty))
+            .collect::<Vec<_>>();
+        if !attached.is_empty() {
+            group = attached;
+        }
+    }
+    group
+        .into_iter()
+        .max_by_key(|process| (process_depth(process.pid, &parents), process.pid))
+        .map(|process| process.name.clone())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn foreground_process(_master: &dyn MasterPty) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+struct ProcessInfo {
+    pid: i32,
+    ppid: i32,
+    pgrp: i32,
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+fn read_process(pid: i32) -> Option<ProcessInfo> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .get(stat.rfind(") ")? + 2..)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(ProcessInfo {
+        pid,
+        ppid: fields.get(1)?.parse().ok()?,
+        pgrp: fields.get(2)?.parse().ok()?,
+        name: std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()?
+            .trim()
+            .to_string(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_attached_to_tty(pid: i32, tty: &std::path::Path) -> bool {
+    [0, 1, 2]
+        .into_iter()
+        .any(|fd| std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).is_ok_and(|path| path == tty))
+}
+
+#[cfg(target_os = "linux")]
+fn process_depth(pid: i32, parents: &HashMap<i32, i32>) -> usize {
+    let mut current = pid;
+    let mut seen = HashSet::new();
+    while current > 0 && seen.insert(current) {
+        let Some(parent) = parents.get(&current) else {
+            break;
+        };
+        current = *parent;
+    }
+    seen.len()
 }
 
 fn run_writer(
@@ -1262,11 +1432,11 @@ mod tests {
         let mut pending = None;
 
         assert!(matches!(
-            receive_actor_message(&messages, &mut pending).unwrap(),
+            receive_actor_message(&messages, &mut pending, Duration::from_secs(1)).unwrap(),
             ActorMessage::Output(bytes) if bytes == b"abcdef"
         ));
         assert!(matches!(
-            receive_actor_message(&messages, &mut pending).unwrap(),
+            receive_actor_message(&messages, &mut pending, Duration::from_secs(1)).unwrap(),
             ActorMessage::Shutdown
         ));
     }

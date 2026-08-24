@@ -26,6 +26,8 @@ replay, and explicit lifecycle state.
 - Promotion demotes the previous controller without closing its subscription.
 - Promotion, canonical resize, and input are one ordered actor command.
 - Subscription replay and live events cross one ordered actor boundary.
+- OSC 0/2 title changes update authoritative terminal metadata and publish ordered subscription events.
+- The deepest TTY-attached process in the foreground process group updates authoritative process metadata.
 - Controller delivery applies backpressure; observers tolerate bounded output bursts and are disconnected when their backlog remains full.
 - Adjacent output is coalesced before fanout, flushing at 8 KiB, after 1 ms, or before the next non-output event.
 
@@ -55,6 +57,8 @@ A snapshot is built on the actor thread and contains owned values only:
 - Plain parsed screen text
 - VT checkpoint synthesized by libghostty formatter
 - Raw replay head and tail offsets
+- Current title derived from libghostty state
+- Current foreground process derived from PTY process state
 
 No borrowed libghostty object crosses a thread boundary.
 
@@ -70,10 +74,10 @@ The CLI ensures one detached `opencode-pty` process through a private service
 registration and authenticated Unix socket. The process owns the registry and
 terminal threads. CLI exit does not affect terminal lifetime.
 
-Protocol v4 uses four-byte big-endian framing with bounded UTF-8 JSON control
+Protocol v6 uses four-byte big-endian framing with bounded UTF-8 JSON control
 frames and tagged raw binary output frames. It supports ping, create, list,
 write, resize, atomic interaction promotion, snapshot, replay, replay-to-live
-subscriptions, controller takeover, terminate, and destructive service
+subscriptions, title updates, controller takeover, terminate, and destructive service
 shutdown.
 
 Registration is written atomically with private permissions and contains an

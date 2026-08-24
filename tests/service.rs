@@ -95,6 +95,101 @@ fn hidden_terminal_output_uses_bounded_replay() {
 }
 
 #[test]
+fn title_changes_update_metadata_and_notify_subscribers() {
+    let service = TerminalService::new(64 * 1024);
+    let terminal = service
+        .create(command(
+            r"sleep 0.05; printf '\033]2;dynamic-title\007'; sleep 0.2",
+        ))
+        .expect("terminal created");
+    let observer = service
+        .attach(
+            terminal.id,
+            0,
+            "observer".to_string(),
+            AttachmentRole::Observer,
+            false,
+        )
+        .expect("observer attached");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let title = loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for title change"
+        );
+        match observer.events.recv_timeout(Duration::from_millis(50)) {
+            Ok(StreamEvent::TitleChanged { title }) => break title,
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                panic!("observer disconnected before title change")
+            }
+        }
+    };
+
+    assert_eq!(title, "dynamic-title");
+    assert!(service.list().is_ok_and(|items| {
+        items
+            .iter()
+            .any(|item| item.id == terminal.id && item.title == "dynamic-title")
+    }));
+
+    service.terminate(terminal.id).expect("terminal removed");
+}
+
+#[test]
+fn foreground_process_tracks_deepest_tty_attached_job() {
+    let service = TerminalService::new(64 * 1024);
+    let terminal = service
+        .create(command("exec /bin/sh"))
+        .expect("terminal created");
+    let controller = service
+        .attach(
+            terminal.id,
+            0,
+            "controller".to_string(),
+            AttachmentRole::Controller,
+            false,
+        )
+        .expect("controller attached");
+    service
+        .input(
+            terminal.id,
+            "controller".to_string(),
+            80,
+            24,
+            b"tail -f /dev/null & sleep 5\n".to_vec(),
+        )
+        .expect("sleep submitted");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let process = loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for foreground process"
+        );
+        match controller.events.recv_timeout(Duration::from_millis(50)) {
+            Ok(StreamEvent::ForegroundProcessChanged {
+                process: Some(process),
+            }) if process == "sleep" => break process,
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                panic!("controller disconnected before foreground process change")
+            }
+        }
+    };
+
+    assert_eq!(process, "sleep");
+    assert!(service.list().is_ok_and(|items| {
+        items.iter().any(|item| {
+            item.id == terminal.id && item.foreground_process.as_deref() == Some("sleep")
+        })
+    }));
+
+    service.terminate(terminal.id).expect("terminal removed");
+}
+
+#[test]
 fn bursty_output_does_not_disconnect_a_healthy_observer() {
     let service = TerminalService::new(2 * 1024 * 1024);
     let terminal = service

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::service::{TerminalId, TerminalInfo};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const OUTPUT_FRAME_TAG: u8 = 0;
 
@@ -135,6 +135,12 @@ pub enum Response {
         attachment_id: Option<String>,
         generation: u64,
     },
+    TitleChanged {
+        title: String,
+    },
+    ForegroundProcessChanged {
+        process: Option<String>,
+    },
     Error {
         message: String,
     },
@@ -182,13 +188,14 @@ pub enum SubscriptionEvent {
         end: u64,
         bytes: Vec<u8>,
     },
-    Response(Response),
+    Response(Box<Response>),
 }
 
 pub fn read_subscription_event(mut reader: impl Read) -> Result<SubscriptionEvent> {
     let payload = read_payload(&mut reader)?;
     if payload.first() != Some(&OUTPUT_FRAME_TAG) {
         return serde_json::from_slice(&payload)
+            .map(Box::new)
             .map(SubscriptionEvent::Response)
             .context("invalid protocol JSON");
     }
