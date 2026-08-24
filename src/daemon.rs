@@ -309,7 +309,9 @@ mod unix {
                 break Ok(());
             }
         };
-        let _ = stream.shutdown(Shutdown::Both);
+        // A full shutdown can discard a just-written final frame on macOS.
+        // Half-close first so the peer drains queued output before closing.
+        let _ = stream.shutdown(Shutdown::Write);
         let _ = monitor.join();
         result
     }
