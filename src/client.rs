@@ -368,6 +368,14 @@ pub fn run_cli() -> Result<()> {
                 .context("expected terminal ID")?;
             watch(id)
         }
+        Some("version" | "--version" | "-V") => {
+            println!(
+                "opencode-pty {} (protocol {})",
+                env!("CARGO_PKG_VERSION"),
+                crate::protocol::PROTOCOL_VERSION
+            );
+            Ok(())
+        }
         Some("help" | "--help" | "-h") => {
             print_usage();
             Ok(())
@@ -618,7 +626,7 @@ fn set_stdin_raw() -> Result<()> {
 }
 
 fn print_usage() {
-    println!("usage: opencode-pty [play|status|list|watch ID|stop]");
+    println!("usage: opencode-pty [play|status|list|watch ID|stop|--version]");
 }
 
 fn print_help() {

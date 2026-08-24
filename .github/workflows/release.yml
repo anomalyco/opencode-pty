@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOCOL_VERSION: 6
+  ZIG_VERSION: 0.15.2
+
+jobs:
+  checks:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install Rust
+        run: rustup toolchain install 1.90.0 --profile minimal --component clippy --component rustfmt
+      - name: Validate tag
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "opencode-pty") | .version')"
+          test "$version" = "$package_version"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install Rust target
+        run: rustup toolchain install 1.90.0 --profile minimal --target "${{ matrix.target }}"
+      - name: Test
+        run: cargo test --locked --target "${{ matrix.target }}"
+      - name: Build
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Smoke test
+        run: |
+          output="$("target/${{ matrix.target }}/release/opencode-pty" --version)"
+          test "$output" = "opencode-pty ${GITHUB_REF_NAME#v} (protocol $PROTOCOL_VERSION)"
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="opencode-pty-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/opencode-pty" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-pty-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: opencode-pty-*
+          merge-multiple: true
+      - name: Create checksums and manifest
+        working-directory: dist
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha256sum opencode-pty-*.tar.gz > SHA256SUMS
+          artifacts='[]'
+          while read -r sha256 archive; do
+            target="${archive#opencode-pty-${version}-}"
+            target="${target%.tar.gz}"
+            artifacts="$(jq --arg target "$target" --arg archive "$archive" --arg sha256 "$sha256" '. + [{target: $target, archive: $archive, sha256: $sha256}]' <<<"$artifacts")"
+          done < SHA256SUMS
+          jq -n \
+            --arg version "$version" \
+            --argjson protocol "$PROTOCOL_VERSION" \
+            --argjson artifacts "$artifacts" \
+            '{schema: 1, version: $version, protocol: $protocol, artifacts: $artifacts}' \
+            > release-manifest.json
+          sha256sum release-manifest.json >> SHA256SUMS
+      - uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --prerelease --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi

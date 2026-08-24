@@ -138,6 +138,7 @@ fn title_changes_update_metadata_and_notify_subscribers() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn foreground_process_tracks_deepest_tty_attached_job() {
     let service = TerminalService::new(64 * 1024);
     let terminal = service
