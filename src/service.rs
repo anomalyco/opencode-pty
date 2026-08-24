@@ -1,5 +1,7 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;

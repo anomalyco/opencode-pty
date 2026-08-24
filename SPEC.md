@@ -82,7 +82,9 @@ shutdown.
 
 Registration is written atomically with private permissions and contains an
 instance ID, PID, protocol version, socket path, and random credential. A
-service lock elects one process and protects stale socket cleanup.
+service lock elects one process and protects stale socket cleanup. On Unix, the
+socket uses a fixed-length hash of the canonical database-keyed runtime path
+under a private per-user `/tmp` directory to stay below platform path limits.
 
 OpenCode chooses a database-keyed runtime directory before spawning the daemon,
 so servers using the same database reconnect to one PTY service while different

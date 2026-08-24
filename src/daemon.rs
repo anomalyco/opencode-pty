@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const REGISTRATION_FILE: &str = "service.json";
-pub const SOCKET_FILE: &str = "service.sock";
 pub const LOCK_FILE: &str = "service.lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -18,7 +17,8 @@ pub struct Registration {
 #[cfg(unix)]
 mod unix {
     use std::fs::{self, OpenOptions};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,8 +29,9 @@ mod unix {
     use anyhow::{Context, Result, anyhow};
     use base64::Engine;
     use fs2::FileExt;
+    use sha2::{Digest, Sha256};
 
-    use super::{LOCK_FILE, REGISTRATION_FILE, Registration, SOCKET_FILE};
+    use super::{LOCK_FILE, REGISTRATION_FILE, Registration};
     use crate::protocol::{
         Envelope, PROTOCOL_VERSION, Request, Response, read_frame, write_frame, write_output_frame,
     };
@@ -71,7 +72,7 @@ mod unix {
         lock.try_lock_exclusive()
             .context("another opencode-pty process already owns the service lock")?;
 
-        let socket_path = directory.join(SOCKET_FILE);
+        let socket_path = socket_path(&directory)?;
         if socket_path.exists() {
             fs::remove_file(&socket_path)?;
         }
@@ -126,6 +127,43 @@ mod unix {
         remove_if_current(&registration)?;
         let _ = fs::remove_file(&socket_path);
         drop(lock);
+        Ok(())
+    }
+
+    fn socket_path(directory: &std::path::Path) -> Result<PathBuf> {
+        let directory =
+            fs::canonicalize(directory).context("failed to resolve PTY runtime directory")?;
+        let digest = Sha256::digest(directory.as_os_str().as_bytes());
+        let name = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let root = PathBuf::from("/tmp").join(format!(
+            "opencode-pty-{}",
+            nix::unistd::Uid::effective().as_raw()
+        ));
+        ensure_private_directory(&root)?;
+        Ok(root.join(format!("{name}.sock")))
+    }
+
+    fn ensure_private_directory(directory: &std::path::Path) -> Result<()> {
+        fs::create_dir_all(directory)?;
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "PTY socket directory is not a real directory: {}",
+                directory.display()
+            ));
+        }
+        let uid = nix::unistd::Uid::effective().as_raw();
+        if metadata.uid() != uid {
+            return Err(anyhow!(
+                "PTY socket directory {} is owned by uid {}, expected {uid}",
+                directory.display(),
+                metadata.uid()
+            ));
+        }
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
@@ -412,6 +450,30 @@ mod unix {
 
     fn random_id() -> String {
         format!("{:032x}", rand::random::<u128>())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn socket_paths_are_short_and_runtime_specific() {
+            let base =
+                std::env::temp_dir().join(format!("opencode-pty-socket-test-{}", random_id()));
+            let first = base.join("a".repeat(120)).join("database-a");
+            let second = base.join("b".repeat(120)).join("database-b");
+            fs::create_dir_all(&first).unwrap();
+            fs::create_dir_all(&second).unwrap();
+
+            let first_socket = socket_path(&first).unwrap();
+            let second_socket = socket_path(&second).unwrap();
+
+            assert_ne!(first_socket, second_socket);
+            assert!(first_socket.as_os_str().as_bytes().len() < 104);
+            assert_eq!(first_socket.parent(), second_socket.parent());
+
+            fs::remove_dir_all(base).unwrap();
+        }
     }
 }
 
