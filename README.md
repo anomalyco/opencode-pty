@@ -104,7 +104,7 @@ printf 'demo\nlist\nquit\n' | cargo run -- play
 ## Releases
 
 Pushing a `vX.Y.Z` tag matching the version in `Cargo.toml` creates an unsigned
-GitHub prerelease. The release contains x86-64 and arm64 binaries for Linux GNU,
+GitHub release. The release contains x86-64 and arm64 binaries for Linux GNU,
 Linux musl, and macOS, plus `SHA256SUMS`, a machine-readable
 `release-manifest.json`, and GitHub build-provenance attestations.
 
@@ -114,8 +114,7 @@ push origin v0.1.0
 ```
 
 Windows artifacts are intentionally excluded until the persistent transport
-uses named pipes. Platform signing will be added before releases are promoted
-from prerelease status.
+uses named pipes. Platform signing will be added later.
 
 ## Current Limits
 
