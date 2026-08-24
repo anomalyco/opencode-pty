@@ -124,20 +124,21 @@ fn terminal_survives_between_cli_processes() {
 #[test]
 fn observer_stream_replays_and_follows_until_exit() {
     let runtime = runtime_dir("stream");
-    let first =
-        Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
-            .arg("play")
-            .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                child.stdin.as_mut().expect("stdin").write_all(
-                    b"new /bin/sh -c \"sleep 0.1; printf watched; sleep 0.1\"\nquit\n",
-                )?;
-                child.wait_with_output()
-            })
-            .expect("terminal created");
+    let first = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
+        .arg("play")
+        .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(b"new /bin/sh -c \"printf watched; sleep 2\"\nquit\n")?;
+            child.wait_with_output()
+        })
+        .expect("terminal created");
     assert!(first.status.success());
     let terminal_id = created_terminal_id(&first.stdout);
 
@@ -150,6 +151,11 @@ fn observer_stream_replays_and_follows_until_exit() {
         .map(output_with_timeout)
         .expect("observer exits with terminal");
     stop(&runtime);
-    assert!(watched.status.success());
+    assert!(
+        watched.status.success(),
+        "watch failed with {:?}: {}",
+        watched.status.code(),
+        String::from_utf8_lossy(&watched.stderr)
+    );
     assert!(String::from_utf8_lossy(&watched.stdout).contains("watched"));
 }
