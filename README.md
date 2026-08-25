@@ -106,7 +106,9 @@ printf 'demo\nlist\nquit\n' | cargo run -- play
 Pushing a `vX.Y.Z` tag matching the version in `Cargo.toml` creates an unsigned
 GitHub release. The release contains x86-64 and arm64 binaries for Linux GNU,
 Linux musl, and macOS, plus `SHA256SUMS`, a machine-readable
-`release-manifest.json`, and GitHub build-provenance attestations.
+`release-manifest.json`, and GitHub build-provenance attestations. Release
+builds force Ghostty's Zig code generation to its baseline CPU target so
+artifacts do not inherit instruction-set extensions from CI runners.
 
 ```sh
 git tag v0.1.0

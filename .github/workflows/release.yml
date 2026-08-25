@@ -23,6 +23,11 @@ jobs:
       - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
         with:
           version: ${{ env.ZIG_VERSION }}
+      - name: Configure baseline Zig builds
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/script/release-bin/zig"
+          echo "OPENCODE_REAL_ZIG=$(command -v zig)" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/script/release-bin" >> "$GITHUB_PATH"
       - name: Install Rust
         run: rustup toolchain install 1.90.0 --profile minimal --component clippy --component rustfmt
       - name: Validate tag
@@ -64,6 +69,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ matrix.target }}
+      - name: Configure baseline Zig builds
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/script/release-bin/zig"
+          echo "OPENCODE_REAL_ZIG=$(command -v zig)" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/script/release-bin" >> "$GITHUB_PATH"
       - name: Install musl toolchain
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -79,8 +89,16 @@ jobs:
       - name: Smoke test
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "opencode-pty") | .version')"
-          output="$("target/${{ matrix.target }}/release/opencode-pty" --version)"
+          binary="target/${{ matrix.target }}/release/opencode-pty"
+          output="$("$binary" --version)"
           test "$output" = "opencode-pty $version (protocol $PROTOCOL_VERSION)"
+          runtime="$RUNNER_TEMP/opencode-pty-release-smoke"
+          rm -rf "$runtime"
+          printf 'new /bin/sh -c "printf release-smoke; sleep 1"\nscreen\nquit\n' \
+            | OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" play > "$RUNNER_TEMP/opencode-pty-release-smoke.log"
+          grep -q 'release-smoke' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
+          grep -q 'checkpoint' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
+          OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" stop
       - name: Package
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "opencode-pty") | .version')"
