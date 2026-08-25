@@ -24,7 +24,7 @@ await mkdir(output, { recursive: true })
 
 for (const target of targets) {
   const suffix = [target.platform, target.arch, target.suffix].filter(Boolean).join("-")
-  const name = `@opencode-ai/opencode-pty-${suffix}`
+  const name = `@opencode-ai/pty-${suffix}`
   const directory = path.join(output, `opencode-pty-${suffix}`)
   const archive = path.join(dist, `opencode-pty-${manifest.version}-${target.target}.tar.gz`)
   const temporary = await mkdtemp(path.join(os.tmpdir(), "opencode-pty-npm-"))

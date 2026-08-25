@@ -9,5 +9,5 @@ const suffix = [process.platform, arch, libc].filter(Boolean).join("-")
 
 export const binaryPath =
   supported && arch
-    ? path.join(path.dirname(require.resolve(`@opencode-ai/opencode-pty-${suffix}/package.json`)), "bin", "opencode-pty")
+    ? path.join(path.dirname(require.resolve(`@opencode-ai/pty-${suffix}/package.json`)), "bin", "opencode-pty")
     : undefined

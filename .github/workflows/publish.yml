@@ -210,7 +210,7 @@ jobs:
               npm publish "$package" --access public --provenance
             fi
           done
-          name="@opencode-ai/opencode-pty"
+          name="@opencode-ai/pty"
           if ! npm view "$name@$version" version >/dev/null 2>&1; then
             npm publish dist/npm/opencode-pty --access public --provenance
           fi
