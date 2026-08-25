@@ -114,7 +114,7 @@ jobs:
           test "$output" = "opencode-pty $version (protocol $PROTOCOL_VERSION)"
           runtime="$RUNNER_TEMP/opencode-pty-release-smoke"
           rm -rf "$runtime"
-          printf 'new /bin/sh -c "printf release-smoke; sleep 1"\nscreen\nquit\n' \
+          printf 'new /bin/sh -c "printf release-smoke; sleep 1"\nwait 250\nquit\n' \
             | OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" play > "$RUNNER_TEMP/opencode-pty-release-smoke.log"
           grep -q 'release-smoke' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
           grep -q 'checkpoint' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
