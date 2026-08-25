@@ -111,6 +111,14 @@ builds force Ghostty's Zig code generation to its baseline CPU target so
 artifacts do not inherit instruction-set extensions from CI runners. Linux GNU
 artifacts support glibc 2.30 and newer.
 
+Tagged releases also publish `@opencode-ai/opencode-pty` to npm with optional,
+platform-specific binary packages. Installing the npm package selects the native
+binary for the current platform and exposes its path as `binaryPath`:
+
+```js
+import { binaryPath } from "@opencode-ai/opencode-pty"
+```
+
 ```sh
 git tag v0.1.0
 push origin v0.1.0
