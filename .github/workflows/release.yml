@@ -14,6 +14,8 @@ env:
   CARGO_TERM_COLOR: always
   PROTOCOL_VERSION: 6
   ZIG_VERSION: 0.15.2
+  GNU_GLIBC_VERSION: "2.30"
+  CARGO_ZIGBUILD_VERSION: 0.23.2
 
 jobs:
   checks:
@@ -79,13 +81,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Install Rust target
         run: rustup toolchain install 1.90.0 --profile minimal --target "${{ matrix.target }}"
+      - name: Install glibc baseline linker
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: cargo install cargo-zigbuild --locked --version "$CARGO_ZIGBUILD_VERSION"
       - name: Test service
         run: cargo test --locked --target "${{ matrix.target }}" --lib --test service
       - name: Test CLI integration
         if: runner.os != 'macOS'
         run: cargo test --locked --target "${{ matrix.target }}" --test playground
       - name: Build
-        run: cargo build --locked --release --target "${{ matrix.target }}"
+        run: |
+          if [[ "${{ matrix.target }}" == *-linux-gnu ]]; then
+            cargo zigbuild --locked --release --target "${{ matrix.target }}.$GNU_GLIBC_VERSION"
+          else
+            cargo build --locked --release --target "${{ matrix.target }}"
+          fi
+      - name: Verify glibc baseline
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: |
+          binary="target/${{ matrix.target }}/release/opencode-pty"
+          required="$(readelf --version-info "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -V | tail -n 1)"
+          echo "Highest required glibc version: $required"
+          test "$(printf '%s\n' "$required" "$GNU_GLIBC_VERSION" | sort -V | tail -n 1)" = "$GNU_GLIBC_VERSION"
       - name: Smoke test
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "opencode-pty") | .version')"
