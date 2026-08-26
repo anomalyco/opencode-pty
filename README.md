@@ -11,6 +11,25 @@ The CLI automatically discovers or starts a persistent background process. The
 service uses a private authenticated Unix socket and atomic registration file;
 terminals survive individual CLI processes exiting.
 
+Integrations can instead launch `opencode-pty daemon --owned` (protocol 7).
+The server must claim the daemon within 5 seconds by sending the authenticated
+framed envelope `{"token":"...","request":{"op":"own","instance_id":"..."}}`.
+The response is `{"type":"owned"}`; that connection stays open as the sole
+owner. Ordinary requests and subscriptions use their existing separate sockets.
+The instance ID and token come from the private registration file. Plain
+`daemon` and the playground remain unmanaged and reject ownership requests.
+
+Losing the owner connection stops the daemon and its terminals unless the owner
+first sends `{"token":"...","request":{"op":"prepare_handoff"}}` on that same
+socket. The response is `{"type":"handoff","ticket":"...","expires_at":123}`,
+where `expires_at` is Unix milliseconds, 120 seconds from preparation. Repeated
+preparation during that window returns the same ticket and deadline. After the
+old owner disconnects, a successor claims the same instance with the ticket in
+its `own` request. A live owner cannot be displaced, and successful adoption
+consumes the ticket. Expiry stops an unowned daemon; if the old owner is still
+connected, expiry simply cancels the handoff. `shutdown` always stops the daemon,
+including during handoff. No ownership or handoff state is persisted.
+
 ## Architecture
 
 ```text

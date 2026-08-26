@@ -354,7 +354,11 @@ fn spawn_daemon() -> Result<()> {
 pub fn run_cli() -> Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("daemon") => crate::daemon::run(),
+        Some("daemon") => match (args.next().as_deref(), args.next()) {
+            (None, None) => crate::daemon::run(),
+            (Some("--owned"), None) => crate::daemon::run_owned(),
+            _ => bail!("usage: opencode-pty daemon [--owned]"),
+        },
         Some("fixture") => run_fixture(),
         None | Some("play") => play(),
         Some("status") => status(),
@@ -626,7 +630,7 @@ fn set_stdin_raw() -> Result<()> {
 }
 
 fn print_usage() {
-    println!("usage: opencode-pty [play|status|list|watch ID|stop|--version]");
+    println!("usage: opencode-pty [play|status|list|watch ID|stop|daemon [--owned]|--version]");
 }
 
 fn print_help() {

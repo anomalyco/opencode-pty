@@ -17,6 +17,7 @@ pub struct Registration {
 #[cfg(unix)]
 mod unix {
     use std::fs::{self, OpenOptions};
+    use std::net::Shutdown;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,7 +25,7 @@ mod unix {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result, anyhow};
     use base64::Engine;
@@ -32,6 +33,7 @@ mod unix {
     use sha2::{Digest, Sha256};
 
     use super::{LOCK_FILE, REGISTRATION_FILE, Registration};
+    use crate::ownership::Ownership;
     use crate::protocol::{
         Envelope, PROTOCOL_VERSION, Request, Response, read_frame, write_frame, write_output_frame,
     };
@@ -59,6 +61,14 @@ mod unix {
     }
 
     pub fn run() -> Result<()> {
+        run_daemon(false)
+    }
+
+    pub fn run_owned() -> Result<()> {
+        run_daemon(true)
+    }
+
+    fn run_daemon(owned: bool) -> Result<()> {
         let directory = service_dir();
         fs::create_dir_all(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
@@ -87,30 +97,45 @@ mod unix {
             socket: socket_path.clone(),
             token: random_id(),
         };
+        let ownership = Arc::new(Mutex::new(Ownership::new(owned, Instant::now())));
         write_registration(&directory, &registration)?;
 
         let service = Arc::new(TerminalService::default());
         let shutdown = Arc::new(AtomicBool::new(false));
-        let handlers = Mutex::new(Vec::new());
+        let mut handlers = Vec::<(UnixStream, thread::JoinHandle<()>)>::new();
         while !shutdown.load(Ordering::Acquire) {
+            if ownership
+                .lock()
+                .map_err(|_| anyhow!("ownership lock poisoned"))?
+                .tick(Instant::now())
+            {
+                shutdown.store(true, Ordering::Release);
+                break;
+            }
+            for (_, handler) in handlers.extract_if(.., |(_, handler)| handler.is_finished()) {
+                let _ = handler.join();
+            }
             match listener.accept() {
                 Ok((stream, _)) => {
                     // macOS inherits the listener's nonblocking mode on accepted sockets.
                     stream.set_nonblocking(false)?;
+                    let control = stream.try_clone()?;
                     let service = Arc::clone(&service);
                     let shutdown = Arc::clone(&shutdown);
+                    let ownership = Arc::clone(&ownership);
                     let registration = registration.clone();
                     let handle = thread::spawn(move || {
-                        if let Err(error) =
-                            handle_connection(stream, &service, &registration, &shutdown)
-                        {
+                        if let Err(error) = handle_connection(
+                            stream,
+                            &service,
+                            &registration,
+                            &shutdown,
+                            &ownership,
+                        ) {
                             eprintln!("opencode-pty request failed: {error:#}");
                         }
                     });
-                    handlers
-                        .lock()
-                        .map_err(|_| anyhow!("handler lock poisoned"))?
-                        .push(handle);
+                    handlers.push((control, handle));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -119,15 +144,31 @@ mod unix {
             }
         }
 
-        for handler in handlers
-            .into_inner()
-            .map_err(|_| anyhow!("handler lock poisoned"))?
-        {
+        drop(listener);
+        // Unblock partial requests, owner reads, and backpressured subscriptions
+        // before joining. PTY workers still use their existing termination path.
+        for (stream, _) in &handlers {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        let (cleanup_tx, cleanup_rx) = crossbeam_channel::bounded::<()>(1);
+        let cleanup_registration = registration.clone();
+        let watchdog = thread::spawn(move || {
+            if cleanup_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                eprintln!("opencode-pty cleanup timed out; forcing exit");
+                let _ = remove_if_current(&cleanup_registration);
+                let _ = fs::remove_file(&cleanup_registration.socket);
+                std::process::exit(1);
+            }
+        });
+        service.shutdown();
+        for (_, handler) in handlers {
             let _ = handler.join();
         }
         drop(service);
         remove_if_current(&registration)?;
         let _ = fs::remove_file(&socket_path);
+        let _ = cleanup_tx.send(());
+        let _ = watchdog.join();
         drop(lock);
         Ok(())
     }
@@ -174,6 +215,7 @@ mod unix {
         service: &TerminalService,
         registration: &Registration,
         shutdown: &AtomicBool,
+        ownership: &Mutex<Ownership>,
     ) -> Result<()> {
         let envelope: Envelope = read_frame(&mut stream)?;
         if envelope.token != registration.token {
@@ -183,6 +225,36 @@ mod unix {
                     message: "authentication failed".to_string(),
                 },
             );
+        }
+        if let Request::Own {
+            instance_id,
+            ticket,
+        } = envelope.request
+        {
+            let claim = if instance_id != registration.instance_id {
+                Err(anyhow!("daemon instance_id mismatch"))
+            } else if shutdown.load(Ordering::Acquire) {
+                Err(anyhow!("daemon is stopping"))
+            } else {
+                ownership
+                    .lock()
+                    .map_err(|_| anyhow!("ownership lock poisoned"))?
+                    .claim(ticket.as_deref(), Instant::now())
+            };
+            if let Err(error) = claim {
+                return write_frame(
+                    &mut stream,
+                    &Response::Error {
+                        message: error.to_string(),
+                    },
+                );
+            }
+            let result = owner_connection(&mut stream, registration, shutdown, ownership);
+            ownership
+                .lock()
+                .map_err(|_| anyhow!("ownership lock poisoned"))?
+                .disconnect(Instant::now());
+            return result;
         }
         if let Request::Subscribe {
             id,
@@ -205,13 +277,64 @@ mod unix {
                 },
             );
         }
-        let response =
-            dispatch(envelope.request, service, registration, shutdown).unwrap_or_else(|error| {
+        let stopping = matches!(envelope.request, Request::Shutdown);
+        let response = dispatch(envelope.request, service, registration).unwrap_or_else(|error| {
+            Response::Error {
+                message: format!("{error:#}"),
+            }
+        });
+        let result = write_frame(&mut stream, &response);
+        if stopping {
+            shutdown.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn owner_connection(
+        stream: &mut UnixStream,
+        registration: &Registration,
+        shutdown: &AtomicBool,
+        ownership: &Mutex<Ownership>,
+    ) -> Result<()> {
+        write_frame(&mut *stream, &Response::Owned)?;
+        while !shutdown.load(Ordering::Acquire) {
+            let envelope: Envelope = read_frame(&mut *stream)?;
+            let stopping = envelope.token == registration.token
+                && matches!(envelope.request, Request::Shutdown);
+            let response = if envelope.token != registration.token {
                 Response::Error {
-                    message: format!("{error:#}"),
+                    message: "authentication failed".to_string(),
                 }
-            });
-        write_frame(&mut stream, &response)
+            } else {
+                match envelope.request {
+                    Request::PrepareHandoff => {
+                        let handoff = ownership
+                            .lock()
+                            .map_err(|_| anyhow!("ownership lock poisoned"))?
+                            .prepare(
+                                Instant::now(),
+                                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+                            )?;
+                        Response::Handoff {
+                            ticket: handoff.ticket,
+                            expires_at: handoff.expires_at,
+                        }
+                    }
+                    Request::Shutdown => Response::Ok,
+                    _ => Response::Error {
+                        message: "owner connection only accepts prepare_handoff or shutdown"
+                            .to_string(),
+                    },
+                }
+            };
+            let result = write_frame(&mut *stream, &response);
+            if stopping {
+                shutdown.store(true, Ordering::Release);
+                return result;
+            }
+            result?;
+        }
+        Ok(())
     }
 
     struct SubscriptionRequest {
@@ -259,7 +382,7 @@ mod unix {
             let _ = monitor_stream.read(&mut byte);
             let _ = disconnect_tx.send(());
         });
-        let result = loop {
+        let result = (|| loop {
             if shutdown.load(Ordering::Acquire) {
                 break Ok(());
             }
@@ -310,7 +433,7 @@ mod unix {
             if matches!(response, Response::Exited { .. }) {
                 break Ok(());
             }
-        };
+        })();
         // A full shutdown can discard a just-written final frame on macOS.
         // Half-close first so the peer drains queued output before closing.
         let _ = stream.shutdown(Shutdown::Write);
@@ -322,7 +445,6 @@ mod unix {
         request: Request,
         service: &TerminalService,
         registration: &Registration,
-        shutdown: &AtomicBool,
     ) -> Result<Response> {
         Ok(match request {
             Request::Ping => Response::Pong {
@@ -422,10 +544,11 @@ mod unix {
                 service.terminate(id)?;
                 Response::Ok
             }
-            Request::Shutdown => {
-                shutdown.store(true, Ordering::Release);
-                Response::Ok
-            }
+            Request::Shutdown => Response::Ok,
+            Request::Own { .. } => unreachable!("ownership is handled before dispatch"),
+            Request::PrepareHandoff => Response::Error {
+                message: "handoff requires the owner connection".to_string(),
+            },
         })
     }
 
@@ -482,11 +605,16 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{read_registration, registration_path, run, service_dir};
+pub use unix::{read_registration, registration_path, run, run_owned, service_dir};
 
 #[cfg(not(unix))]
 pub fn run() -> anyhow::Result<()> {
     anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
+}
+
+#[cfg(not(unix))]
+pub fn run_owned() -> anyhow::Result<()> {
+    run()
 }
 
 #[cfg(not(unix))]
