@@ -27,7 +27,6 @@ const WRITER_QUEUE_CAPACITY: usize = 128;
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
 const OUTPUT_BATCH_BYTES: usize = 8 * 1024;
 const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(1);
-const FOREGROUND_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 pub type TerminalId = u64;
@@ -202,13 +201,18 @@ impl TerminalService {
     }
 
     pub fn list(&self) -> Result<Vec<TerminalInfo>> {
-        let mut terminals = self
+        let handles = self
             .terminals
             .lock()
             .map_err(|_| anyhow!("terminal registry lock poisoned"))?
             .values()
-            .map(|terminal| terminal.info())
+            .cloned()
             .collect::<Vec<_>>();
+        let mut terminals = Vec::with_capacity(handles.len());
+        for terminal in handles {
+            terminal.request(|reply| ActorMessage::RefreshForegroundProcess { reply })?;
+            terminals.push(terminal.info());
+        }
         terminals.sort_by_key(|terminal| terminal.id);
         Ok(terminals)
     }
@@ -579,6 +583,9 @@ enum ActorMessage {
     ReaderFailed(String),
     WriterFailed(String),
     ChildExited(Result<Option<u32>, String>),
+    RefreshForegroundProcess {
+        reply: std_mpsc::SyncSender<Result<()>>,
+    },
     Write {
         attachment_id: Option<String>,
         bytes: Vec<u8>,
@@ -683,25 +690,20 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     let mut reader_eof = false;
     let mut exit_published = false;
     let mut pending_message = None;
-    let mut next_foreground_process_poll = Instant::now();
     let _ = init_tx.send(Ok(()));
 
     loop {
-        if Instant::now() >= next_foreground_process_poll {
-            publish_foreground_process(
-                &*master,
-                &info,
-                &mut subscribers,
-                &mut controller,
-                &mut controller_generation,
-            );
-            next_foreground_process_poll = Instant::now() + FOREGROUND_PROCESS_POLL_INTERVAL;
-        }
-        match receive_actor_message(
-            &messages,
-            &mut pending_message,
-            next_foreground_process_poll.saturating_duration_since(Instant::now()),
-        ) {
+        match receive_actor_message(&messages, &mut pending_message) {
+            Ok(ActorMessage::RefreshForegroundProcess { reply }) => {
+                publish_foreground_process(
+                    &*master,
+                    &info,
+                    &mut subscribers,
+                    &mut controller,
+                    &mut controller_generation,
+                );
+                let _ = reply.send(Ok(()));
+            }
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
@@ -989,11 +991,12 @@ fn run_actor(config: ActorConfig) -> Result<()> {
 fn receive_actor_message(
     messages: &Receiver<ActorMessage>,
     pending: &mut Option<ActorMessage>,
-    timeout: Duration,
 ) -> std::result::Result<ActorMessage, crossbeam_channel::RecvTimeoutError> {
     let message = match pending.take() {
         Some(message) => message,
-        None => messages.recv_timeout(timeout)?,
+        None => messages
+            .recv()
+            .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)?,
     };
     let ActorMessage::Output(mut bytes) = message else {
         return Ok(message);
@@ -1434,11 +1437,11 @@ mod tests {
         let mut pending = None;
 
         assert!(matches!(
-            receive_actor_message(&messages, &mut pending, Duration::from_secs(1)).unwrap(),
+            receive_actor_message(&messages, &mut pending).unwrap(),
             ActorMessage::Output(bytes) if bytes == b"abcdef"
         ));
         assert!(matches!(
-            receive_actor_message(&messages, &mut pending, Duration::from_secs(1)).unwrap(),
+            receive_actor_message(&messages, &mut pending).unwrap(),
             ActorMessage::Shutdown
         ));
     }

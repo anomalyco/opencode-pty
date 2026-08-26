@@ -169,6 +169,7 @@ fn foreground_process_tracks_deepest_tty_attached_job() {
             Instant::now() < deadline,
             "timed out waiting for foreground process"
         );
+        service.list().expect("foreground process refreshed");
         match controller.events.recv_timeout(Duration::from_millis(50)) {
             Ok(StreamEvent::ForegroundProcessChanged {
                 process: Some(process),
