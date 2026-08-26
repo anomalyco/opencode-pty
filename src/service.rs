@@ -1174,7 +1174,7 @@ fn format_terminal(terminal: &Terminal<'_, '_>, format: Format) -> Result<String
         .with_tabstops(true)
         .with_pwd(true)
         .with_keyboard(true)
-        .with_cursor(true)
+        .with_cursor(false)
         .with_style(true)
         .with_hyperlink(true)
         .with_protection(true)
@@ -1182,7 +1182,16 @@ fn format_terminal(terminal: &Terminal<'_, '_>, format: Format) -> Result<String
         .with_charsets(true);
     let mut formatter = Formatter::new(terminal, options)?;
     let bytes = formatter.format_alloc(None)?;
-    Ok(String::from_utf8_lossy(bytes.as_ref()).into_owned())
+    let output = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+    if format != Format::Vt {
+        return Ok(output);
+    }
+    // Ghostty restores tab stops after screen state, moving the cursor in the process.
+    Ok(format!(
+        "{output}\x1b[{};{}H",
+        terminal.cursor_y()? + 1,
+        terminal.cursor_x()? + 1,
+    ))
 }
 
 fn update_offsets(info: &Arc<RwLock<TerminalInfo>>, replay: &ReplayBuffer) {
@@ -1327,6 +1336,80 @@ fn default_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_restores_cursor_and_tabstops() {
+        for (cols, rows) in [(80, 24), (30, 100), (100, 30)] {
+            for input in [
+                "",
+                "hello\r\nworld\x1b[2;3H",
+                "\x1b[3g\x1b[5G\x1bH\x1b[15G\x1bH\x1b[3;4H",
+                "\x1b[3;20r\x1b[5;7H",
+            ] {
+                let mut source = Terminal::new(TerminalOptions {
+                    cols: 80,
+                    rows: 24,
+                    max_scrollback: 0,
+                })
+                .unwrap();
+                source.vt_write(input.as_bytes());
+                source.resize(cols, rows, 0, 0).unwrap();
+                let checkpoint = format_terminal(&source, Format::Vt).unwrap();
+                let mut restored = Terminal::new(TerminalOptions {
+                    cols,
+                    rows,
+                    max_scrollback: 0,
+                })
+                .unwrap();
+                restored.vt_write(checkpoint.as_bytes());
+
+                assert_eq!(restored.cursor_x().unwrap(), source.cursor_x().unwrap());
+                assert_eq!(restored.cursor_y().unwrap(), source.cursor_y().unwrap());
+                assert_eq!(
+                    format_terminal(&restored, Format::Plain).unwrap(),
+                    format_terminal(&source, Format::Plain).unwrap(),
+                );
+
+                source.vt_write(b"\tcontinued");
+                restored.vt_write(b"\tcontinued");
+                assert_eq!(
+                    format_terminal(&restored, Format::Plain).unwrap(),
+                    format_terminal(&source, Format::Plain).unwrap(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_does_not_leave_zsh_partial_line_marker() {
+        let options = TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        };
+        let source = Terminal::new(options).unwrap();
+        let checkpoint = format_terminal(&source, Format::Vt).unwrap();
+        let mut restored = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        restored.vt_write(checkpoint.as_bytes());
+        restored.vt_write(
+            format!(
+                "\x1b[1m\x1b[7m%\x1b[0m{}\r \r\r\x1b[Jprompt% ",
+                " ".repeat(79)
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            format_terminal(&restored, Format::Plain).unwrap(),
+            "prompt%"
+        );
+        assert_eq!(restored.cursor_y().unwrap(), 0);
+    }
 
     #[test]
     fn replay_reports_truncation_and_offsets() {
