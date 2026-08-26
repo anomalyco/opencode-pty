@@ -32,6 +32,62 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
+fn read_rows_snapshots_live_state_without_taking_control() {
+    let service = TerminalService::default();
+    let mut request =
+        command(r"printf '\033]2;rows-title\007one\ntwo\nthree\nfour\nfive'; sleep 1");
+    request.cols = 10;
+    request.rows = 3;
+    let terminal = service.create(request).expect("terminal created");
+    wait_for(|| {
+        service
+            .read_rows(terminal.id, None)
+            .is_ok_and(|rows| rows.lines == ["three", "four", "five"])
+    });
+    let controller = service
+        .attach(
+            terminal.id,
+            0,
+            "controller".to_string(),
+            AttachmentRole::Controller,
+            false,
+        )
+        .unwrap();
+    let snapshot = service.snapshot(terminal.id).unwrap();
+    let replay = service.replay(terminal.id, 0).unwrap();
+    let rows = service.read_rows(terminal.id, Some(u16::MAX)).unwrap();
+    assert_eq!(rows.lines, ["one", "two", "three", "four", "five"]);
+    assert_eq!(rows.terminal.id, terminal.id);
+    assert_eq!(rows.terminal.title, "rows-title");
+    assert_eq!((rows.terminal.cols, rows.terminal.rows), (10, 3));
+    assert_eq!((rows.cursor_x, rows.cursor_y), (4, 2));
+    assert_eq!(rows.terminal.output_tail, replay.end_offset);
+    assert_eq!(
+        service.snapshot(terminal.id).unwrap().checkpoint,
+        snapshot.checkpoint
+    );
+    assert_eq!(service.replay(terminal.id, 0).unwrap().bytes, replay.bytes);
+    assert!(service.resize(terminal.id, 12, 4).is_err());
+    service
+        .resize_for(terminal.id, Some("controller".to_string()), 12, 4)
+        .unwrap();
+    let rows = service.read_rows(terminal.id, None).unwrap();
+    assert_eq!(rows.lines, ["two", "three", "four", "five"]);
+    assert_eq!((rows.terminal.cols, rows.terminal.rows), (12, 4));
+    assert_eq!((rows.cursor_x, rows.cursor_y), (4, 3));
+    assert!(
+        service
+            .read_rows(terminal.id, Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("positive")
+    );
+    drop(controller);
+    service.terminate(terminal.id).unwrap();
+    assert!(service.read_rows(terminal.id, None).is_err());
+}
+
+#[test]
 fn terminals_run_independently_and_one_exit_does_not_stop_service() {
     let service = TerminalService::new(64 * 1024);
     let alpha = service

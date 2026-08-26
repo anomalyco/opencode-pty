@@ -12,7 +12,7 @@ use crate::protocol::{
     AttachmentRole, Envelope, PROTOCOL_VERSION, Request, Response, SubscriptionEvent, read_frame,
     read_subscription_event, write_frame,
 };
-use crate::service::{CreateTerminal, TerminalId, TerminalInfo};
+use crate::service::{CreateTerminal, TerminalId, TerminalInfo, TerminalRows};
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -201,6 +201,23 @@ impl TerminalClient {
                 checkpoint: base64::engine::general_purpose::STANDARD
                     .decode(checkpoint_base64)
                     .context("invalid checkpoint base64")?,
+                cursor_x,
+                cursor_y,
+            }),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn read_rows(&self, id: TerminalId, rows: Option<u16>) -> Result<TerminalRows> {
+        match self.request(Request::ReadRows { id, rows })? {
+            Response::Rows {
+                terminal,
+                lines,
+                cursor_x,
+                cursor_y,
+            } => Ok(TerminalRows {
+                terminal,
+                lines,
                 cursor_x,
                 cursor_y,
             }),

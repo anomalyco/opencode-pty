@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
+use libghostty_vt::selection::Selection;
+use libghostty_vt::terminal::{Point, PointCoordinate};
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,7 @@ const SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
 const OUTPUT_BATCH_BYTES: usize = 8 * 1024;
 const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(1);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_ROWS_BYTES: usize = 1024 * 1024;
 
 pub type TerminalId = u64;
 
@@ -60,6 +63,14 @@ pub struct TerminalSnapshot {
     pub info: TerminalInfo,
     pub text: String,
     pub checkpoint: Vec<u8>,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalRows {
+    pub terminal: TerminalInfo,
+    pub lines: Vec<String>,
     pub cursor_x: u16,
     pub cursor_y: u16,
 }
@@ -298,6 +309,11 @@ impl TerminalService {
     pub fn snapshot(&self, id: TerminalId) -> Result<TerminalSnapshot> {
         self.get(id)?
             .request(|reply| ActorMessage::Snapshot { reply })
+    }
+
+    pub fn read_rows(&self, id: TerminalId, rows: Option<u16>) -> Result<TerminalRows> {
+        self.get(id)?
+            .request(|reply| ActorMessage::ReadRows { rows, reply })
     }
 
     pub fn replay(&self, id: TerminalId, offset: u64) -> Result<RawReplay> {
@@ -607,6 +623,10 @@ enum ActorMessage {
     Snapshot {
         reply: std_mpsc::SyncSender<Result<TerminalSnapshot>>,
     },
+    ReadRows {
+        rows: Option<u16>,
+        reply: std_mpsc::SyncSender<Result<TerminalRows>>,
+    },
     Replay {
         offset: u64,
         reply: std_mpsc::SyncSender<Result<RawReplay>>,
@@ -864,6 +884,20 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             }
             Ok(ActorMessage::Snapshot { reply }) => {
                 let _ = reply.send(make_snapshot(&terminal, &info));
+            }
+            Ok(ActorMessage::ReadRows { rows, reply }) => {
+                let result = (|| {
+                    Ok(TerminalRows {
+                        lines: format_rows(&terminal, rows)?,
+                        terminal: info
+                            .read()
+                            .map_err(|_| anyhow!("terminal info lock poisoned"))?
+                            .clone(),
+                        cursor_x: terminal.cursor_x()?,
+                        cursor_y: terminal.cursor_y()?,
+                    })
+                })();
+                let _ = reply.send(result);
             }
             Ok(ActorMessage::Replay { offset, reply }) => {
                 let _ = reply.send(replay.read_from(offset));
@@ -1164,6 +1198,52 @@ fn make_snapshot(
     })
 }
 
+fn format_rows(terminal: &Terminal<'_, '_>, rows: Option<u16>) -> Result<Vec<String>> {
+    let rows = rows.unwrap_or(terminal.rows()?);
+    if rows == 0 {
+        bail!("row count must be positive");
+    }
+    let total = terminal.total_rows()?;
+    let count = usize::from(rows).min(total);
+    // Charge both JSON punctuation and owned String slots, including empty rows.
+    let mut bytes = 2 + count * (size_of::<String>() + 1);
+    if bytes > MAX_ROWS_BYTES {
+        bail!("rows exceed {MAX_ROWS_BYTES} byte limit");
+    }
+    let mut lines = Vec::with_capacity(count);
+    let mut buffer = vec![0; MAX_ROWS_BYTES - bytes];
+    let cols = terminal.cols()?;
+    for y in total - count..total {
+        let y = u32::try_from(y).context("terminal row index exceeds u32")?;
+        let selection = Selection::new(
+            terminal.grid_ref(Point::Screen(PointCoordinate { x: 0, y }))?,
+            terminal.grid_ref(Point::Screen(PointCoordinate { x: cols - 1, y }))?,
+            false,
+        );
+        // A single-row selection preserves blank rows without joining soft wraps.
+        let mut formatter = Formatter::new(
+            terminal,
+            FormatterOptions::new()
+                .with_format(Format::Plain)
+                .with_unwrap(false)
+                .with_trim(true)
+                .with_selection(&selection),
+        )?;
+        let len = formatter
+            .format_buf(&mut buffer[..MAX_ROWS_BYTES - bytes])
+            .with_context(|| {
+                format!("rows exceed {MAX_ROWS_BYTES} byte limit or formatting failed")
+            })?;
+        let line = std::str::from_utf8(&buffer[..len])?;
+        bytes += serde_json::to_vec(line)?.len();
+        if bytes > MAX_ROWS_BYTES {
+            bail!("rows exceed {MAX_ROWS_BYTES} byte limit");
+        }
+        lines.push(line.to_owned());
+    }
+    Ok(lines)
+}
+
 fn format_terminal(terminal: &Terminal<'_, '_>, format: Format) -> Result<String> {
     let options = FormatterOptions::new()
         .with_format(format)
@@ -1336,6 +1416,173 @@ fn default_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows_terminal(cols: u16, rows: u16, input: &str) -> Terminal<'static, 'static> {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: 2 * 1024 * 1024,
+        })
+        .unwrap();
+        terminal.vt_write(input.as_bytes());
+        terminal
+    }
+
+    #[test]
+    fn rows_include_live_height_and_preserve_blank_rows() {
+        let terminal = rows_terminal(10, 5, "");
+        assert_eq!(format_rows(&terminal, None).unwrap(), ["", "", "", "", ""]);
+        let terminal = rows_terminal(10, 5, "\x1b[31mone  \x1b[0m\r\n\r\n  three\r\n");
+        assert_eq!(
+            format_rows(&terminal, None).unwrap(),
+            ["one", "", "  three", "", ""]
+        );
+        assert_eq!(format_rows(&terminal, Some(2)).unwrap(), ["", ""]);
+        assert_eq!(
+            format_rows(&terminal, Some(u16::MAX)).unwrap(),
+            ["one", "", "  three", "", ""]
+        );
+    }
+
+    #[test]
+    fn rows_include_history_only_when_requested() {
+        let terminal = rows_terminal(10, 3, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert_eq!(
+            format_rows(&terminal, None).unwrap(),
+            ["three", "four", "five"]
+        );
+        assert_eq!(format_rows(&terminal, Some(2)).unwrap(), ["four", "five"]);
+        assert_eq!(
+            format_rows(&terminal, Some(4)).unwrap(),
+            ["two", "three", "four", "five"]
+        );
+        assert_eq!(
+            format_rows(&terminal, Some(u16::MAX)).unwrap(),
+            ["one", "two", "three", "four", "five"]
+        );
+    }
+
+    #[test]
+    fn rows_keep_physical_wraps_and_unicode_graphemes() {
+        let terminal = rows_terminal(4, 3, "abcdefghij");
+        assert_eq!(
+            format_rows(&terminal, None).unwrap(),
+            ["abcd", "efgh", "ij"]
+        );
+        assert_eq!(format_rows(&terminal, Some(2)).unwrap(), ["efgh", "ij"]);
+        let terminal = rows_terminal(4, 3, "a\u{301}\u{754c}bc");
+        assert_eq!(
+            format_rows(&terminal, None).unwrap(),
+            ["a\u{301}\u{754c}b", "c", ""]
+        );
+    }
+
+    #[test]
+    fn rows_isolate_alternate_screen_and_restore_primary_history() {
+        let mut terminal = rows_terminal(10, 3, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let primary = format_rows(&terminal, Some(u16::MAX)).unwrap();
+        terminal.vt_write(b"\x1b[?1049hA\r\nB\r\nC\r\nD\r\nE");
+        assert_eq!(
+            format_rows(&terminal, Some(u16::MAX)).unwrap(),
+            ["C", "D", "E"]
+        );
+        assert_eq!(format_rows(&terminal, None).unwrap(), ["C", "D", "E"]);
+        terminal.vt_write(b"\x1b[?1049l");
+        assert_eq!(format_rows(&terminal, Some(u16::MAX)).unwrap(), primary);
+    }
+
+    #[test]
+    fn rows_follow_resize_and_reflow() {
+        let mut terminal = rows_terminal(4, 3, "abcdefghij");
+        terminal.resize(6, 4, 0, 0).unwrap();
+        assert_eq!(
+            format_rows(&terminal, None).unwrap(),
+            ["abcdef", "ghij", "", ""]
+        );
+        terminal.resize(4, 2, 0, 0).unwrap();
+        assert_eq!(format_rows(&terminal, None).unwrap(), ["efgh", "ij"]);
+        assert_eq!(
+            format_rows(&terminal, Some(3)).unwrap(),
+            ["abcd", "efgh", "ij"]
+        );
+    }
+
+    #[test]
+    fn rows_do_not_change_viewport_selection_cursor_or_checkpoint() {
+        use libghostty_vt::selection::FormatOptions;
+        use libghostty_vt::terminal::ScrollViewport;
+
+        let mut terminal = rows_terminal(10, 3, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let selection = Selection::new(
+            terminal
+                .grid_ref(Point::Screen(PointCoordinate { x: 0, y: 0 }))
+                .unwrap(),
+            terminal
+                .grid_ref(Point::Screen(PointCoordinate { x: 2, y: 0 }))
+                .unwrap(),
+            false,
+        );
+        terminal.set_selection(Some(&selection)).unwrap();
+        let viewport = terminal
+            .grid_ref(Point::Viewport(PointCoordinate { x: 0, y: 0 }))
+            .unwrap();
+        let checkpoint = format_terminal(&terminal, Format::Vt).unwrap();
+        let cursor = (terminal.cursor_x().unwrap(), terminal.cursor_y().unwrap());
+        assert_eq!(
+            format_rows(&terminal, None).unwrap(),
+            ["three", "four", "five"]
+        );
+        assert_eq!(format_terminal(&terminal, Format::Vt).unwrap(), checkpoint);
+        assert_eq!(
+            (terminal.cursor_x().unwrap(), terminal.cursor_y().unwrap()),
+            cursor
+        );
+        assert_eq!(
+            terminal
+                .point_from_grid_ref(&viewport, libghostty_vt::terminal::PointSpace::Viewport)
+                .unwrap(),
+            Some(PointCoordinate { x: 0, y: 0 })
+        );
+        let mut buffer = [0; 32];
+        let len = terminal
+            .format_selection_buf(FormatOptions::new(), &mut buffer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..len], b"one");
+    }
+
+    #[test]
+    fn rows_reject_zero_and_bound_escaped_payload_by_bytes() {
+        let terminal = rows_terminal(10, 3, "");
+        assert!(
+            format_rows(&terminal, Some(0))
+                .unwrap_err()
+                .to_string()
+                .contains("positive")
+        );
+        for (character, rows) in [("x", 1100), ("\"", 600)] {
+            let terminal = rows_terminal(1000, rows, &character.repeat(1000 * usize::from(rows)));
+            assert!(
+                format_rows(&terminal, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("byte limit")
+            );
+            assert_eq!(
+                format_rows(&terminal, Some(1)).unwrap(),
+                [character.repeat(1000)]
+            );
+        }
+        let terminal = rows_terminal(1, u16::MAX, "");
+        assert!(
+            format_rows(&terminal, None)
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit")
+        );
+        assert_eq!(format_rows(&terminal, Some(1)).unwrap(), [""]);
+    }
 
     #[test]
     fn checkpoint_restores_cursor_and_tabstops() {

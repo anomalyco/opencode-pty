@@ -407,6 +407,15 @@ mod unix {
                     cursor_y: snapshot.cursor_y,
                 }
             }
+            Request::ReadRows { id, rows } => {
+                let rows = service.read_rows(id, rows)?;
+                Response::Rows {
+                    terminal: rows.terminal,
+                    lines: rows.lines,
+                    cursor_x: rows.cursor_x,
+                    cursor_y: rows.cursor_y,
+                }
+            }
             Request::Replay { id, offset } => {
                 let replay = service.replay(id, offset)?;
                 Response::Replay {
