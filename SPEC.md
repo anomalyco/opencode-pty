@@ -62,6 +62,33 @@ A snapshot is built on the actor thread and contains owned values only:
 
 No borrowed libghostty object crosses a thread boundary.
 
+## Row Reads
+
+`Request::ReadRows { id, rows: Option<u16> }` (`op: "read_rows"`) returns
+`Response::Rows { terminal, lines, cursor_x, cursor_y }` (`type: "rows"`). Both
+the service and Rust client expose `read_rows(id, rows)`. Omitted or null rows
+defaults to the current terminal height; zero is rejected. A larger count
+includes retained history, up to all available rows of the active buffer.
+Counts cannot exceed `u16::MAX`.
+
+The actor selects the last physical rows using libghostty's total active-buffer
+row count and full-screen grid coordinates, independent of the viewport.
+Each row is formatted separately as plain text with soft-wrap unwrapping
+disabled and trailing whitespace trimmed. Blank rows remain empty strings,
+including internal and trailing blanks. Alternate-screen reads cannot include
+primary-screen history. Resizes are observed in actor order, including reflow.
+Rows, terminal metadata, and zero-based active-screen cursor coordinates are
+captured in the same actor command. Cursor coordinates are not rebased to the
+returned history rows. No viewport, selection, controller, snapshot,
+checkpoint, or replay state is changed.
+
+Row reads have a 1 MiB budget for JSON-escaped row strings, array punctuation,
+and owned-string slots (including blank rows); formatting buffers are also
+bounded. Results exceeding that budget fail rather than truncate. Complete
+responses remain subject to the transport's 8 MiB frame limit. This is an
+additive protocol 6 operation requiring a binary that implements `read_rows`;
+no existing request or response changes.
+
 ## Failure Boundary
 
 The persistent `opencode-pty` process survives OpenCode server and client
@@ -76,7 +103,7 @@ terminal threads. CLI exit does not affect terminal lifetime.
 
 Protocol v6 uses four-byte big-endian framing with bounded UTF-8 JSON control
 frames and tagged raw binary output frames. It supports ping, create, list,
-write, resize, atomic interaction promotion, snapshot, replay, replay-to-live
+write, resize, atomic interaction promotion, snapshot, read_rows, replay, replay-to-live
 subscriptions, title updates, controller takeover, terminate, and destructive service
 shutdown.
 
