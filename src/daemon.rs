@@ -95,6 +95,8 @@ mod unix {
         while !shutdown.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // macOS inherits the listener's nonblocking mode on accepted sockets.
+                    stream.set_nonblocking(false)?;
                     let service = Arc::clone(&service);
                     let shutdown = Arc::clone(&shutdown);
                     let registration = registration.clone();

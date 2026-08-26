@@ -131,11 +131,9 @@ fn observer_stream_replays_and_follows_until_exit() {
         .stdout(Stdio::piped())
         .spawn()
         .and_then(|mut child| {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin")
-                .write_all(b"new /bin/sh -c \"printf watched; sleep 2\"\nquit\n")?;
+            child.stdin.as_mut().expect("stdin").write_all(
+                b"new /bin/sh -c \"printf watched; sleep 2; printf followed\"\nquit\n",
+            )?;
             child.wait_with_output()
         })
         .expect("terminal created");
@@ -158,4 +156,5 @@ fn observer_stream_replays_and_follows_until_exit() {
         String::from_utf8_lossy(&watched.stderr)
     );
     assert!(String::from_utf8_lossy(&watched.stdout).contains("watched"));
+    assert!(String::from_utf8_lossy(&watched.stdout).contains("followed"));
 }
