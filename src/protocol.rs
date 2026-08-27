@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::service::{TerminalId, TerminalInfo};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const OUTPUT_FRAME_TAG: u8 = 0;
 
@@ -27,6 +27,11 @@ pub struct Envelope {
 #[serde(rename_all = "snake_case", tag = "op")]
 pub enum Request {
     Ping,
+    Own {
+        instance_id: String,
+        ticket: Option<String>,
+    },
+    PrepareHandoff,
     Create {
         program: String,
         args: Vec<String>,
@@ -89,6 +94,11 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Response {
+    Owned,
+    Handoff {
+        ticket: String,
+        expires_at: u64,
+    },
     Pong {
         instance_id: String,
         pid: u32,
@@ -272,6 +282,6 @@ mod tests {
                 .is_err()
             );
         }
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 }

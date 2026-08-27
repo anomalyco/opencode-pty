@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PROTOCOL_VERSION: 6
+  PROTOCOL_VERSION: 7
   ZIG_VERSION: 0.15.2
   GNU_GLIBC_VERSION: "2.30"
   CARGO_ZIGBUILD_VERSION: 0.23.2
@@ -88,7 +88,7 @@ jobs:
         if: endsWith(matrix.target, '-linux-gnu')
         run: cargo install cargo-zigbuild --locked --version "$CARGO_ZIGBUILD_VERSION"
       - name: Test service
-        run: cargo test --locked --target "${{ matrix.target }}" --lib --test service
+        run: cargo test --locked --target "${{ matrix.target }}" --lib --test service --test ownership
       - name: Test CLI integration
         if: runner.os != 'macOS'
         run: cargo test --locked --target "${{ matrix.target }}" --test playground
@@ -118,7 +118,7 @@ jobs:
             | OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" play > "$RUNNER_TEMP/opencode-pty-release-smoke.log"
           grep -q 'release-smoke' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
           grep -q 'checkpoint' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
-          OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" stop
+          test ! -e "$runtime/service.json"
       - name: Package
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "opencode-pty") | .version')"

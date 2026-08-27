@@ -373,23 +373,33 @@ impl TerminalService {
             .cloned()
             .ok_or_else(|| anyhow!("terminal {id} not found"))
     }
-}
 
-impl Drop for TerminalService {
-    fn drop(&mut self) {
+    pub(crate) fn shutdown(&self) {
         let terminals = self
             .terminals
-            .get_mut()
-            .map(|terminals| {
+            .lock()
+            .map(|mut terminals| {
                 terminals
                     .drain()
                     .map(|(_, terminal)| terminal)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for terminal in terminals {
-            let _ = terminal.shutdown();
-        }
+        // Start every terminal's existing kill/join path before waiting for any
+        // one terminal's potentially blocked PTY workers.
+        thread::scope(|scope| {
+            for terminal in terminals {
+                scope.spawn(move || {
+                    let _ = terminal.shutdown();
+                });
+            }
+        });
+    }
+}
+
+impl Drop for TerminalService {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

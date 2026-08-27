@@ -46,7 +46,7 @@ fn daemon_client_read_rows_roundtrip() {
         );
 
         let registration = opencode_pty::daemon::read_registration().unwrap();
-        assert_eq!(registration.protocol, 6);
+        assert_eq!(registration.protocol, 7);
         // Exercise omitted rows independently of the Rust client's null encoding.
         let mut stream = std::os::unix::net::UnixStream::connect(registration.socket).unwrap();
         write_frame(
@@ -83,6 +83,24 @@ fn daemon_client_read_rows_roundtrip() {
     while !runtime.join(REGISTRATION_FILE).exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
+    let registration: Registration =
+        serde_json::from_slice(&std::fs::read(runtime.join(REGISTRATION_FILE)).unwrap()).unwrap();
+    let mut owner = std::os::unix::net::UnixStream::connect(&registration.socket).unwrap();
+    write_frame(
+        &mut owner,
+        &Envelope {
+            token: registration.token,
+            request: Request::Own {
+                instance_id: registration.instance_id,
+                ticket: None,
+            },
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame::<Response>(&mut owner).unwrap(),
+        Response::Owned
+    ));
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -92,28 +110,8 @@ fn daemon_client_read_rows_roundtrip() {
         .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
         .env("OPENCODE_PTY_ROWS_TEST_CHILD", "1")
         .output();
-    let registration = std::fs::read(runtime.join(REGISTRATION_FILE))
-        .ok()
-        .and_then(|data| serde_json::from_slice::<Registration>(&data).ok());
-    if let Some(registration) = registration {
-        let mut stream = std::os::unix::net::UnixStream::connect(registration.socket).unwrap();
-        write_frame(
-            &mut stream,
-            &Envelope {
-                token: registration.token,
-                request: Request::Shutdown,
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            read_frame::<Response>(&mut stream).unwrap(),
-            Response::Ok
-        ));
-        daemon.wait().unwrap();
-    } else {
-        let _ = daemon.kill();
-        let _ = daemon.wait();
-    }
+    drop(owner);
+    assert!(daemon.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(runtime);
     let output = result.unwrap();
     assert!(

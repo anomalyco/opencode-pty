@@ -7,9 +7,28 @@ maintain authoritative terminal state and answer terminal protocol queries.
 Every terminal has isolated blocking I/O and actor threads, so one terminal
 cannot block the service or another terminal.
 
-The CLI automatically discovers or starts a persistent background process. The
-service uses a private authenticated Unix socket and atomic registration file;
-terminals survive individual CLI processes exiting.
+Every daemon has one owner connection. The playground starts a daemon and holds
+that connection until exit; exiting the playground stops the daemon and all its
+terminals. Observer commands connect to an existing daemon without taking ownership.
+The service uses a private authenticated Unix socket and atomic registration file.
+
+Integrations launch `opencode-pty daemon` (protocol 7).
+The server must claim the daemon within 5 seconds by sending the authenticated
+framed envelope `{"token":"...","request":{"op":"own","instance_id":"..."}}`.
+The response is `{"type":"owned"}`; that connection stays open as the sole
+owner. Ordinary requests and subscriptions use their existing separate sockets.
+The instance ID and token come from the private registration file.
+
+Losing the owner connection stops the daemon and its terminals unless the owner
+first sends `{"token":"...","request":{"op":"prepare_handoff"}}` on that same
+socket. The response is `{"type":"handoff","ticket":"...","expires_at":123}`,
+where `expires_at` is Unix milliseconds, 120 seconds from preparation. Repeated
+preparation during that window returns the same ticket and deadline. After the
+old owner disconnects, a successor claims the same instance with the ticket in
+its `own` request. A live owner cannot be displaced, and successful adoption
+consumes the ticket. Expiry stops an unowned daemon; if the old owner is still
+connected, expiry simply cancels the handoff. `shutdown` always stops the daemon,
+including during handoff. No ownership or handoff state is persisted.
 
 ## Architecture
 
@@ -56,8 +75,9 @@ cargo run -- list
 cargo run -- stop  # destructive: terminates every terminal
 ```
 
-`play` and `list` ensure the service is running. `status` and `stop` only connect
-to an existing service.
+`play` starts and owns a new daemon; it cannot adopt an already running daemon.
+`list`, `status`, `watch`, and `stop` only connect to an existing service and never
+start one. `quit` stops the playground's daemon and terminals.
 
 Commands:
 
@@ -102,7 +122,7 @@ return all available rows. Soft-wrapped rows stay separate, trailing whitespace
 is trimmed, and blank rows (including trailing blank rows) are empty strings.
 The alternate screen never exposes primary-screen history.
 
-The protocol 6 additive request is `{"op":"read_rows","id":1,"rows":30}`;
+The protocol 7 request is `{"op":"read_rows","id":1,"rows":30}`;
 omitted or `null` `rows` uses the current height. Its response is
 `{"type":"rows","terminal":{...},"lines":[...],"cursor_x":0,"cursor_y":0}`.
 Metadata, lines, and zero-based active-screen cursor coordinates come from one
@@ -112,8 +132,7 @@ control. Existing snapshots, checkpoints, and replay are unchanged.
 Row data is bounded to a 1 MiB budget counting JSON-escaped strings, array
 punctuation, and owned-string slot overhead. An excessive result is an error,
 not silently truncated. The existing 8 MiB transport-frame limit still applies
-to the complete response including metadata. Clients using this operation need
-a binary with `read_rows` support; older protocol 6 binaries do not support it.
+to the complete response including metadata.
 
 ## Verification
 
