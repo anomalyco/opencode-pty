@@ -70,6 +70,10 @@ pub enum Request {
     Snapshot {
         id: TerminalId,
     },
+    ReadRows {
+        id: TerminalId,
+        rows: Option<u16>,
+    },
     Replay {
         id: TerminalId,
         offset: u64,
@@ -111,6 +115,12 @@ pub enum Response {
         terminal: TerminalInfo,
         text: String,
         checkpoint_base64: String,
+        cursor_x: u16,
+        cursor_y: u16,
+    },
+    Rows {
+        terminal: TerminalInfo,
+        lines: Vec<String>,
         cursor_x: u16,
         cursor_y: u16,
     },
@@ -233,4 +243,45 @@ fn read_payload(mut reader: impl Read) -> Result<Vec<u8>> {
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload)?;
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_rows_accepts_optional_height_and_u16_counts() {
+        for json in [
+            r#"{"op":"read_rows","id":1}"#,
+            r#"{"op":"read_rows","id":1,"rows":null}"#,
+        ] {
+            assert!(matches!(
+                serde_json::from_str::<Request>(json).unwrap(),
+                Request::ReadRows { id: 1, rows: None }
+            ));
+        }
+        for rows in [0, 1, u16::MAX] {
+            let value = serde_json::to_value(Request::ReadRows {
+                id: 1,
+                rows: Some(rows),
+            })
+            .unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"op": "read_rows", "id": 1, "rows": rows})
+            );
+            assert!(
+                matches!(serde_json::from_value::<Request>(value).unwrap(), Request::ReadRows { rows: Some(count), .. } if count == rows)
+            );
+        }
+        for rows in [-1, 65536] {
+            assert!(
+                serde_json::from_value::<Request>(
+                    serde_json::json!({"op": "read_rows", "id": 1, "rows": rows})
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
 }

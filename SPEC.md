@@ -62,31 +62,61 @@ A snapshot is built on the actor thread and contains owned values only:
 
 No borrowed libghostty object crosses a thread boundary.
 
+## Row Reads
+
+`Request::ReadRows { id, rows: Option<u16> }` (`op: "read_rows"`) returns
+`Response::Rows { terminal, lines, cursor_x, cursor_y }` (`type: "rows"`). Both
+the service and Rust client expose `read_rows(id, rows)`. Omitted or null rows
+defaults to the current terminal height; zero is rejected. A larger count
+includes retained history, up to all available rows of the active buffer.
+Counts cannot exceed `u16::MAX`.
+
+The actor selects the last physical rows using libghostty's total active-buffer
+row count and full-screen grid coordinates, independent of the viewport.
+Each row is formatted separately as plain text with soft-wrap unwrapping
+disabled and trailing whitespace trimmed. Blank rows remain empty strings,
+including internal and trailing blanks. Alternate-screen reads cannot include
+primary-screen history. Resizes are observed in actor order, including reflow.
+Rows, terminal metadata, and zero-based active-screen cursor coordinates are
+captured in the same actor command. Cursor coordinates are not rebased to the
+returned history rows. No viewport, selection, controller, snapshot,
+checkpoint, or replay state is changed.
+
+Row reads have a 1 MiB budget for JSON-escaped row strings, array punctuation,
+and owned-string slots (including blank rows); formatting buffers are also
+bounded. Results exceeding that budget fail rather than truncate. Complete
+responses remain subject to the transport's 8 MiB frame limit. Protocol 7
+supports `read_rows` alongside the existing snapshot and replay operations.
+
 ## Failure Boundary
 
-The persistent `opencode-pty` process survives OpenCode server and client
-restarts. If `opencode-pty` itself dies, its terminals may die. That is an
-accepted boundary and this project does not implement live PTY handoff.
+Losing the owning server connection stops `opencode-pty` and its terminals.
+An explicitly prepared restart handoff allows a replacement server to claim
+the same daemon before a fixed deadline. If `opencode-pty` itself dies, its
+terminals may die; live replacement of the daemon is not supported.
 
 ## Persistent Service Boundary
 
-The CLI ensures one detached `opencode-pty` process through a private service
-registration and authenticated Unix socket. The process owns the registry and
-terminal threads. CLI exit does not affect terminal lifetime.
+Every daemon requires one authenticated owner connection within five seconds
+of startup. Owner loss stops the daemon unless a handoff was prepared on that
+connection. Handoff tickets expire 120 seconds after preparation and are
+consumed by successful replacement ownership. A connected owner cannot be
+displaced. The playground holds ownership until it exits; other CLI commands
+only observe or operate an existing daemon and never start one.
 
-Protocol v6 uses four-byte big-endian framing with bounded UTF-8 JSON control
+Protocol v7 uses four-byte big-endian framing with bounded UTF-8 JSON control
 frames and tagged raw binary output frames. It supports ping, create, list,
-write, resize, atomic interaction promotion, snapshot, replay, replay-to-live
+write, resize, atomic interaction promotion, snapshot, read_rows, replay, replay-to-live
 subscriptions, title updates, controller takeover, terminate, and destructive service
-shutdown.
+shutdown, ownership acquisition, and restart handoff preparation.
 
 Registration is written atomically with private permissions and contains an
 instance ID, PID, protocol version, socket path, and random credential. A
 service lock elects one process and protects stale socket cleanup. On Unix, the
-socket uses a fixed-length hash of the canonical database-keyed runtime path
+socket uses a fixed-length hash of the canonical runtime path
 under a private per-user `/tmp` directory to stay below platform path limits.
 
-OpenCode chooses a database-keyed runtime directory before spawning the daemon,
-so servers using the same database reconnect to one PTY service while different
-databases elect independent services. OpenCode starts the daemon only when the
-first terminal is created.
+OpenCode chooses a fresh UUID runtime directory for each server, independent of
+the database. It starts the daemon only when the first terminal is created.
+Only an explicit restart handoff descriptor lets a replacement server reuse
+the previous daemon's runtime directory and claim its ownership.

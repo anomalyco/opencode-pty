@@ -112,6 +112,28 @@ kill 2
 quit
 ```
 
+## Reading Terminal Rows
+
+`TerminalService::read_rows(id, rows)` and `TerminalClient::read_rows(id, rows)`
+return the last physical rows of the active terminal buffer, including its
+retained scrollback. `rows: Option<u16>` defaults to the live terminal height
+when omitted/`None`; zero is invalid. Counts larger than the available rows
+return all available rows. Soft-wrapped rows stay separate, trailing whitespace
+is trimmed, and blank rows (including trailing blank rows) are empty strings.
+The alternate screen never exposes primary-screen history.
+
+The protocol 7 request is `{"op":"read_rows","id":1,"rows":30}`;
+omitted or `null` `rows` uses the current height. Its response is
+`{"type":"rows","terminal":{...},"lines":[...],"cursor_x":0,"cursor_y":0}`.
+Metadata, lines, and zero-based active-screen cursor coordinates come from one
+actor snapshot. Reading does not move the viewport, change selection, or take
+control. Existing snapshots, checkpoints, and replay are unchanged.
+
+Row data is bounded to a 1 MiB budget counting JSON-escaped strings, array
+punctuation, and owned-string slot overhead. An excessive result is an error,
+not silently truncated. The existing 8 MiB transport-frame limit still applies
+to the complete response including metadata.
+
 ## Verification
 
 ```sh

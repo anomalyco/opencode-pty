@@ -14,11 +14,11 @@
 - [x] Add multi-terminal, lifecycle, replay, and query-response tests.
 - [x] Add persistent daemon startup, election, and atomic private registration.
 - [x] Add authenticated framed IPC and the multi-terminal request API.
-- [x] Prove terminals survive between independent CLI processes.
+- [x] Tie daemon lifetime to one owner and preserve terminals across explicit restart handoff.
 - [x] Add raw replay-to-live subscriptions and bounded slow-subscriber handling.
 - [x] Add exclusive controller and observer roles with explicit takeover.
 - [x] Transport authoritative snapshots and VT checkpoints over IPC.
-- [x] Add a database-keyed, lazy OpenCode backend proxy and ordered groups.
+- [x] Add a lazy OpenCode backend proxy with independent per-server runtime identities.
 
 ## Next
 
