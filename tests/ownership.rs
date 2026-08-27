@@ -21,17 +21,13 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(owned: bool) -> Self {
+    fn start() -> Self {
         let directory = std::env::temp_dir().join(format!(
             "opencode-pty-ownership-{:032x}",
             rand::random::<u128>()
         ));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-pty"));
-        command.arg("daemon");
-        if owned {
-            command.arg("--owned");
-        }
-        let mut child = command
+        let mut child = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
+            .arg("daemon")
             .env("OPENCODE_PTY_RUNTIME_DIR", &directory)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -166,7 +162,7 @@ fn assert_terminal_stopped(terminal: &TerminalInfo) {
 
 #[test]
 fn owner_loss_stops_terminals_despite_blocked_clients() {
-    let mut daemon = Daemon::start(true);
+    let mut daemon = Daemon::start();
     assert!(matches!(
         daemon.request(Request::Own {
             instance_id: "wrong-instance".into(),
@@ -203,7 +199,7 @@ fn owner_loss_stops_terminals_despite_blocked_clients() {
 
 #[test]
 fn handoff_preserves_daemon_and_terminal_and_shutdown_overrides_it() {
-    let mut daemon = Daemon::start(true);
+    let mut daemon = Daemon::start();
     let (mut owner, response) = daemon.own(None);
     assert!(matches!(response, Response::Owned));
     let terminal = daemon.terminal("exec cat");
@@ -281,16 +277,8 @@ fn handoff_preserves_daemon_and_terminal_and_shutdown_overrides_it() {
 }
 
 #[test]
-fn unclaimed_owned_daemon_times_out() {
-    let mut daemon = Daemon::start(true);
+fn unclaimed_daemon_times_out() {
+    let mut daemon = Daemon::start();
     let _partial = daemon.connect();
-    daemon.wait();
-}
-
-#[test]
-fn unmanaged_daemon_rejects_ownership() {
-    let mut daemon = Daemon::start(false);
-    assert!(matches!(daemon.own(None).1, Response::Error { .. }));
-    assert!(matches!(daemon.request(Request::Shutdown), Response::Ok));
     daemon.wait();
 }

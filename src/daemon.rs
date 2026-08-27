@@ -61,14 +61,6 @@ mod unix {
     }
 
     pub fn run() -> Result<()> {
-        run_daemon(false)
-    }
-
-    pub fn run_owned() -> Result<()> {
-        run_daemon(true)
-    }
-
-    fn run_daemon(owned: bool) -> Result<()> {
         let directory = service_dir();
         fs::create_dir_all(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
@@ -97,7 +89,7 @@ mod unix {
             socket: socket_path.clone(),
             token: random_id(),
         };
-        let ownership = Arc::new(Mutex::new(Ownership::new(owned, Instant::now())));
+        let ownership = Arc::new(Mutex::new(Ownership::new(Instant::now())));
         write_registration(&directory, &registration)?;
 
         let service = Arc::new(TerminalService::default());
@@ -605,16 +597,11 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{read_registration, registration_path, run, run_owned, service_dir};
+pub use unix::{read_registration, registration_path, run, service_dir};
 
 #[cfg(not(unix))]
 pub fn run() -> anyhow::Result<()> {
     anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
-}
-
-#[cfg(not(unix))]
-pub fn run_owned() -> anyhow::Result<()> {
-    run()
 }
 
 #[cfg(not(unix))]

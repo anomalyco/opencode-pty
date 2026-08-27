@@ -1,6 +1,5 @@
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +17,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct TerminalClient {
     registration: Registration,
+    #[cfg(unix)]
+    owner: Option<(std::os::unix::net::UnixStream, std::process::Child)>,
 }
 
 #[derive(Debug)]
@@ -55,21 +56,61 @@ impl TerminalSubscription {
 }
 
 impl TerminalClient {
-    pub fn ensure() -> Result<Self> {
-        if let Ok(client) = Self::discover() {
-            return Ok(client);
+    #[cfg(unix)]
+    pub fn start() -> Result<Self> {
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new(env::current_exe()?);
+        command
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: setsid has no memory-safety preconditions. It detaches the
+        // daemon from the playground's terminal before exec.
+        unsafe {
+            command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(io::Error::other));
         }
-        spawn_daemon()?;
+        let mut child = command.spawn().context("failed to spawn opencode-pty")?;
         let deadline = Instant::now() + START_TIMEOUT;
-        let mut last_error = None;
         while Instant::now() < deadline {
-            match Self::discover() {
-                Ok(client) => return Ok(client),
-                Err(error) => last_error = Some(error),
+            if let Some(status) = child.try_wait()? {
+                bail!("opencode-pty daemon exited before ownership acquisition: {status}");
+            }
+            if let Ok(registration) = read_registration()
+                && registration.pid == child.id()
+            {
+                let mut stream = UnixStream::connect(&registration.socket)?;
+                stream.set_read_timeout(Some(START_TIMEOUT))?;
+                stream.set_write_timeout(Some(START_TIMEOUT))?;
+                write_frame(
+                    &mut stream,
+                    &Envelope {
+                        token: registration.token.clone(),
+                        request: Request::Own {
+                            instance_id: registration.instance_id.clone(),
+                            ticket: None,
+                        },
+                    },
+                )?;
+                return match read_frame(&mut stream)? {
+                    Response::Owned => Ok(Self {
+                        registration,
+                        owner: Some((stream, child)),
+                    }),
+                    response => unexpected(response),
+                };
             }
             thread::sleep(Duration::from_millis(50));
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("opencode-pty did not become ready")))
+        bail!("opencode-pty did not become ready")
+    }
+
+    #[cfg(not(unix))]
+    pub fn start() -> Result<Self> {
+        bail!("opencode-pty client transport is not implemented on this platform")
     }
 
     pub fn discover() -> Result<Self> {
@@ -80,7 +121,11 @@ impl TerminalClient {
                 registration.protocol
             );
         }
-        let client = Self { registration };
+        let client = Self {
+            registration,
+            #[cfg(unix)]
+            owner: None,
+        };
         match client.request(Request::Ping)? {
             Response::Pong {
                 instance_id,
@@ -330,40 +375,30 @@ fn unexpected<T>(response: Response) -> Result<T> {
     bail!("unexpected opencode-pty response: {response:?}")
 }
 
-fn spawn_daemon() -> Result<()> {
-    let executable = env::current_exe()?;
-    let mut command = Command::new(executable);
-    command
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid has no memory-safety preconditions. It only detaches
-        // the child process from the launching terminal before exec.
-        unsafe {
-            command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(io::Error::other));
+#[cfg(unix)]
+impl Drop for TerminalClient {
+    fn drop(&mut self) {
+        if let Some((stream, mut child)) = self.owner.take() {
+            drop(stream);
+            let _ = child.wait();
         }
     }
-    command.spawn().context("failed to spawn opencode-pty")?;
-    Ok(())
 }
 
 pub fn run_cli() -> Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("daemon") => match (args.next().as_deref(), args.next()) {
-            (None, None) => crate::daemon::run(),
-            (Some("--owned"), None) => crate::daemon::run_owned(),
-            _ => bail!("usage: opencode-pty daemon [--owned]"),
-        },
+        Some("daemon") => {
+            if args.next().is_some() {
+                bail!("usage: opencode-pty daemon");
+            }
+            crate::daemon::run()
+        }
         Some("fixture") => run_fixture(),
         None | Some("play") => play(),
         Some("status") => status(),
         Some("stop") => stop(),
-        Some("list") => print_terminals(&TerminalClient::ensure()?),
+        Some("list") => print_terminals(&TerminalClient::discover()?),
         Some("watch") => {
             let id = args
                 .next()
@@ -416,7 +451,7 @@ fn stop() -> Result<()> {
 
 #[cfg(unix)]
 fn watch(id: TerminalId) -> Result<()> {
-    let client = TerminalClient::ensure()?;
+    let client = TerminalClient::discover()?;
     let attachment_id = format!(
         "watch-{}-{:016x}",
         std::process::id(),
@@ -456,11 +491,11 @@ fn watch(_id: TerminalId) -> Result<()> {
 }
 
 fn play() -> Result<()> {
-    let client = TerminalClient::ensure()?;
+    let client = TerminalClient::start()?;
     let mut active = client.list()?.first().map(|terminal| terminal.id);
     println!("\n  opencode-pty playground");
     println!(
-        "  connected to persistent service pid={} · terminals survive `quit`\n",
+        "  owning service pid={} · `quit` stops all terminals\n",
         client.registration.pid
     );
     print_help();
@@ -630,7 +665,7 @@ fn set_stdin_raw() -> Result<()> {
 }
 
 fn print_usage() {
-    println!("usage: opencode-pty [play|status|list|watch ID|stop|daemon [--owned]|--version]");
+    println!("usage: opencode-pty [play|status|list|watch ID|stop|daemon|--version]");
 }
 
 fn print_help() {
@@ -645,7 +680,7 @@ fn print_help() {
     println!("  wait [MILLISECONDS]   wait and show active screen");
     println!("  kill [ID]             terminate and remove a terminal");
     println!("  demo                   run parser/query-response demo");
-    println!("  help | quit            quit leaves service and terminals running");
+    println!("  help | quit            quit stops the service and all terminals");
 }
 
 fn print_terminals(client: &TerminalClient) -> Result<()> {

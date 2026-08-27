@@ -118,7 +118,7 @@ jobs:
             | OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" play > "$RUNNER_TEMP/opencode-pty-release-smoke.log"
           grep -q 'release-smoke' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
           grep -q 'checkpoint' "$RUNNER_TEMP/opencode-pty-release-smoke.log"
-          OPENCODE_PTY_RUNTIME_DIR="$runtime" "$binary" stop
+          test ! -e "$runtime/service.json"
       - name: Package
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "opencode-pty") | .version')"

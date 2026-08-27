@@ -7,17 +7,17 @@ maintain authoritative terminal state and answer terminal protocol queries.
 Every terminal has isolated blocking I/O and actor threads, so one terminal
 cannot block the service or another terminal.
 
-The CLI automatically discovers or starts a persistent background process. The
-service uses a private authenticated Unix socket and atomic registration file;
-terminals survive individual CLI processes exiting.
+Every daemon has one owner connection. The playground starts a daemon and holds
+that connection until exit; exiting the playground stops the daemon and all its
+terminals. Observer commands connect to an existing daemon without taking ownership.
+The service uses a private authenticated Unix socket and atomic registration file.
 
-Integrations can instead launch `opencode-pty daemon --owned` (protocol 7).
+Integrations launch `opencode-pty daemon` (protocol 7).
 The server must claim the daemon within 5 seconds by sending the authenticated
 framed envelope `{"token":"...","request":{"op":"own","instance_id":"..."}}`.
 The response is `{"type":"owned"}`; that connection stays open as the sole
 owner. Ordinary requests and subscriptions use their existing separate sockets.
-The instance ID and token come from the private registration file. Plain
-`daemon` and the playground remain unmanaged and reject ownership requests.
+The instance ID and token come from the private registration file.
 
 Losing the owner connection stops the daemon and its terminals unless the owner
 first sends `{"token":"...","request":{"op":"prepare_handoff"}}` on that same
@@ -75,8 +75,9 @@ cargo run -- list
 cargo run -- stop  # destructive: terminates every terminal
 ```
 
-`play` and `list` ensure the service is running. `status` and `stop` only connect
-to an existing service.
+`play` starts and owns a new daemon; it cannot adopt an already running daemon.
+`list`, `status`, `watch`, and `stop` only connect to an existing service and never
+start one. `quit` stops the playground's daemon and terminals.
 
 Commands:
 

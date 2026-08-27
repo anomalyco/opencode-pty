@@ -13,7 +13,6 @@ pub(crate) struct Handoff {
 }
 
 pub(crate) enum Ownership {
-    Unmanaged,
     Starting(Instant),
     Owned(Option<Handoff>),
     Waiting(Handoff),
@@ -21,12 +20,8 @@ pub(crate) enum Ownership {
 }
 
 impl Ownership {
-    pub fn new(owned: bool, now: Instant) -> Self {
-        if owned {
-            Self::Starting(now + ACQUIRE_TIMEOUT)
-        } else {
-            Self::Unmanaged
-        }
+    pub fn new(now: Instant) -> Self {
+        Self::Starting(now + ACQUIRE_TIMEOUT)
     }
 
     pub fn tick(&mut self, now: Instant) -> bool {
@@ -44,7 +39,6 @@ impl Ownership {
         match &*self {
             Self::Starting(_) if ticket.is_none() => {}
             Self::Waiting(handoff) if ticket == Some(handoff.ticket.as_str()) => {}
-            Self::Unmanaged => bail!("daemon was not started with --owned"),
             Self::Owned(_) => bail!("daemon already has a live owner"),
             Self::Stopped => bail!("daemon ownership deadline expired or daemon is stopping"),
             _ => bail!("invalid handoff ticket"),
@@ -83,7 +77,7 @@ mod tests {
     #[test]
     fn acquisition_is_exclusive_and_bounded() {
         let now = Instant::now();
-        let mut owner = Ownership::new(true, now);
+        let mut owner = Ownership::new(now);
         assert!(owner.claim(Some("unexpected"), now).is_err());
         owner.claim(None, now).unwrap();
         assert!(owner.claim(None, now).is_err());
@@ -91,17 +85,16 @@ mod tests {
         assert!(owner.tick(now));
         assert!(owner.claim(None, now).is_err());
 
-        let mut starting = Ownership::new(true, now);
+        let mut starting = Ownership::new(now);
         assert!(!starting.tick(now + ACQUIRE_TIMEOUT - Duration::from_millis(1)));
         assert!(starting.claim(None, now + ACQUIRE_TIMEOUT).is_err());
         assert!(starting.tick(now + ACQUIRE_TIMEOUT));
-        assert!(Ownership::new(false, now).claim(None, now).is_err());
     }
 
     #[test]
     fn handoff_is_nonrenewing_and_consumed_by_claim() {
         let now = Instant::now();
-        let mut owner = Ownership::new(true, now);
+        let mut owner = Ownership::new(now);
         owner.claim(None, now).unwrap();
         let handoff = owner.prepare(now, 1000).unwrap();
         assert_eq!(handoff.expires_at, 121_000);
@@ -124,7 +117,7 @@ mod tests {
     #[test]
     fn expiry_only_stops_a_disconnected_owner() {
         let now = Instant::now();
-        let mut owner = Ownership::new(true, now);
+        let mut owner = Ownership::new(now);
         owner.claim(None, now).unwrap();
         let handoff = owner.prepare(now, 1000).unwrap();
         assert!(!owner.tick(handoff.deadline));
@@ -132,7 +125,7 @@ mod tests {
         owner.disconnect(handoff.deadline);
         assert!(owner.tick(handoff.deadline));
 
-        let mut owner = Ownership::new(true, now);
+        let mut owner = Ownership::new(now);
         owner.claim(None, now).unwrap();
         let handoff = owner.prepare(now, 1000).unwrap();
         owner.disconnect(now);

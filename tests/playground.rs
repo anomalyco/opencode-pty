@@ -1,4 +1,6 @@
-use std::io::Write;
+#![cfg(unix)]
+
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -13,14 +15,6 @@ fn runtime_dir(name: &str) -> PathBuf {
             .expect("clock")
             .as_nanos()
     ))
-}
-
-fn stop(runtime: &PathBuf) {
-    let _ = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
-        .arg("stop")
-        .env("OPENCODE_PTY_RUNTIME_DIR", runtime)
-        .status();
-    let _ = std::fs::remove_dir_all(runtime);
 }
 
 fn output_with_timeout(mut child: std::process::Child) -> std::process::Output {
@@ -51,6 +45,17 @@ fn created_terminal_id(output: &[u8]) -> String {
         .to_string()
 }
 
+fn read_created_terminal(child: &mut std::process::Child) -> String {
+    let mut stdout = BufReader::new(child.stdout.as_mut().expect("stdout"));
+    loop {
+        let mut line = String::new();
+        assert_ne!(stdout.read_line(&mut line).expect("playground output"), 0);
+        if line.contains("created terminal ") {
+            return line;
+        }
+    }
+}
+
 #[test]
 fn playground_proves_authoritative_query_response() {
     let runtime = runtime_dir("query");
@@ -67,8 +72,9 @@ fn playground_proves_authoritative_query_response() {
         .expect("stdin")
         .write_all(b"demo\nwait 50\nquit\n")
         .expect("commands written");
-    let output = child.wait_with_output().expect("playground exits");
-    stop(&runtime);
+    let output = output_with_timeout(child);
+    assert!(!runtime.join("service.json").exists());
+    std::fs::remove_dir_all(&runtime).unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -79,66 +85,101 @@ fn playground_proves_authoritative_query_response() {
 }
 
 #[test]
-fn terminal_survives_between_cli_processes() {
-    let runtime = runtime_dir("persistence");
-    let first = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
+fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
+    let runtime = runtime_dir("ownership");
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
         .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            child
+        .expect("playground starts");
+    let pids = (0..2)
+        .map(|_| {
+            owner
                 .stdin
                 .as_mut()
-                .expect("stdin")
-                .write_all(b"new /bin/sh\nrun printf persistent-marker\\n\nquit\n")?;
-            child.wait_with_output()
+                .unwrap()
+                .write_all(b"new /bin/cat\n")
+                .unwrap();
+            let line = read_created_terminal(&mut owner);
+            line.split_once("Some(")
+                .unwrap()
+                .1
+                .trim_end()
+                .trim_end_matches("))")
+                .parse::<i32>()
+                .unwrap()
         })
-        .expect("first client exits");
-    assert!(first.status.success());
-    let terminal_id = created_terminal_id(&first.stdout);
+        .collect::<Vec<_>>();
 
     let second = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
         .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin")
-                .write_all(b"list\nscreen\nquit\n")?;
-            child.wait_with_output()
-        })
-        .expect("second client exits");
-    stop(&runtime);
-    assert!(second.status.success());
-    let stdout = String::from_utf8_lossy(&second.stdout);
-    assert!(stdout.contains("persistent-marker"), "{stdout}");
-    assert!(stdout.contains(&terminal_id), "{stdout}");
+        .map(output_with_timeout)
+        .unwrap();
+    assert!(
+        !second.status.success(),
+        "second playground must not adopt the live daemon"
+    );
+    for command in ["list", "status"] {
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
+                .arg(command)
+                .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    owner.stdin.as_mut().unwrap().write_all(b"quit\n").unwrap();
+    assert!(output_with_timeout(owner).status.success());
+    assert!(!runtime.join("service.json").exists());
+    for pid in pids {
+        // SAFETY: signal zero only checks whether the terminal PID still exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    for args in [&["list"][..], &["status"], &["watch", "1"]] {
+        assert!(
+            !Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
+                .args(args)
+                .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(!runtime.join("service.json").exists());
+    }
+    std::fs::remove_dir_all(&runtime).unwrap();
 }
 
 #[test]
 fn observer_stream_replays_and_follows_until_exit() {
     let runtime = runtime_dir("stream");
-    let first = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
         .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            child.stdin.as_mut().expect("stdin").write_all(
-                b"new /bin/sh -c \"printf watched; sleep 2; printf followed\"\nquit\n",
-            )?;
-            child.wait_with_output()
-        })
-        .expect("terminal created");
-    assert!(first.status.success());
-    let terminal_id = created_terminal_id(&first.stdout);
+        .expect("playground starts");
+    owner
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"new /bin/sh -c \"printf watched; sleep 2; printf followed\"\n")
+        .unwrap();
+    let terminal_id = created_terminal_id(read_created_terminal(&mut owner).as_bytes());
 
     let watched = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .args(["watch", &terminal_id])
@@ -148,7 +189,10 @@ fn observer_stream_replays_and_follows_until_exit() {
         .spawn()
         .map(output_with_timeout)
         .expect("observer exits with terminal");
-    stop(&runtime);
+    owner.stdin.as_mut().unwrap().write_all(b"quit\n").unwrap();
+    assert!(output_with_timeout(owner).status.success());
+    assert!(!runtime.join("service.json").exists());
+    std::fs::remove_dir_all(&runtime).unwrap();
     assert!(
         watched.status.success(),
         "watch failed with {:?}: {}",
