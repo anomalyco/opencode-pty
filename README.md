@@ -148,8 +148,11 @@ printf 'demo\nlist\nquit\n' | cargo run -- play
 
 ### Windows CI
 
-`.github/workflows/windows.yml` builds and tests natively on Windows x64
-(`windows-2025`) and ARM64 (`windows-11-arm`). It runs on pull requests and
+`.github/workflows/windows.yml` builds for Windows x64 and ARM64 and executes
+tests natively on `windows-2025` and `windows-11-arm`, respectively. The ARM64
+job uses x64-hosted compilers targeting ARM64 because native ARM64 Zig 0.16
+crashes while building Ghostty; the tests themselves remain native ARM64.
+It runs on pull requests and
 pushes to `master` or `windows-*` branches, independently of the release workflow.
 It checks formatting, builds the executable, runs all enabled tests, and checks
 `opencode-pty.exe --version`. It also copies the library test executable out of
