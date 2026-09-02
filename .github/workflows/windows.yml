@@ -59,6 +59,16 @@ jobs:
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e') { throw 'Zig archive checksum mismatch' }
           Expand-Archive $archive -DestinationPath $env:RUNNER_TEMP
           Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0' >> $env:GITHUB_PATH
+      - name: Fix Zig 0.16 ARM64 function-pointer alignment
+        if: matrix.arch == 'arm64'
+        run: |
+          # ARM64 function pointers require 4-byte alignment, unlike *anyopaque.
+          # Zig 0.16's Windows stack-trace helper omits the required alignment assertion.
+          $file = Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0/lib/std/debug/SelfInfo/Windows.zig'
+          $source = [System.IO.File]::ReadAllText($file)
+          $old = '@ptrCast(try si.loadNtdllProc(@tagName(proc)))'
+          if (!$source.Contains($old)) { throw 'Zig alignment workaround no longer matches; re-evaluate it' }
+          [System.IO.File]::WriteAllText($file, $source.Replace($old, '@ptrCast(@alignCast(try si.loadNtdllProc(@tagName(proc))))'))
       - name: Install Rust toolchain and target
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --force-non-host --profile minimal --component rustfmt --target $env:CARGO_BUILD_TARGET
       - name: Verify runner and compiler architecture
