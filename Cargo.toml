@@ -12,7 +12,8 @@ anyhow = "1.0"
 base64 = "0.22"
 crossbeam-channel = "0.5"
 fs2 = "0.4"
-libghostty-vt = "0.2.1"
+# Pin the upstream MSVC static-link fix until it is released on crates.io.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "bac73b914d936e945de4a6b93bed75ae1ce8895c" }
 portable-pty = "0.9.0"
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
@@ -23,9 +24,6 @@ shell-words = "1.1"
 libc = "0.2"
 nix = { version = "0.28", features = ["process", "term", "user"] }
 sha2 = "0.10"
-
-[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
-libghostty-vt-sys = "=0.2.1"
 
 [profile.release]
 codegen-units = 1

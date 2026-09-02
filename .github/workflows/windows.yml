@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
         with:
-          version: 0.15.2
+          version: 0.16.0
           cache-key: ${{ matrix.target }}
       - name: Install native Rust toolchain
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
@@ -60,7 +60,7 @@ jobs:
           zig version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: windows-${{ matrix.target }}-zig-0.15.2
+          key: windows-${{ matrix.target }}-zig-0.16.0
           cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --check
@@ -71,36 +71,22 @@ jobs:
         id: tests
         timeout-minutes: 10
         run: cargo test --locked --all-targets --all-features
-      - name: Run parser test without Cargo's DLL search paths
+      - name: Run standalone library tests
         run: |
           $artifacts = cargo test --locked --lib --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $binary = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }).executable
-          & $binary --exact service::tests::rows_keep_physical_wraps_and_unicode_graphemes --nocapture
+          # Cargo adds native library paths to PATH, which can hide accidental DLL dependencies.
+          # Copy only the executable so neither Cargo nor adjacent build artifacts can supply them.
+          $directory = Join-Path $env:RUNNER_TEMP 'pty-standalone-tests'
+          New-Item -ItemType Directory -Force $directory | Out-Null
+          $standalone = Join-Path $directory 'opencode-pty-tests.exe'
+          Copy-Item $binary $standalone
+          & $standalone
       - name: Diagnose failed library tests
         if: failure() && steps.tests.outcome == 'failure'
         timeout-minutes: 10
         run: cargo test --locked --lib --all-features -- --test-threads=1 --nocapture
-      - name: Debug Windows parser crash
-        if: failure() && steps.tests.outcome == 'failure' && matrix.arch == 'x64'
-        timeout-minutes: 10
-        run: |
-          $artifacts = cargo test --locked --lib --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $binary = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }).executable
-          $paths = $artifacts | Where-Object reason -eq 'build-script-executed' | ForEach-Object linked_paths | ForEach-Object { $_ -replace '^[a-z]+=', '' }
-          Write-Output $paths
-          $env:PATH = ($paths -join ';') + ';' + $env:PATH
-          $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
-          if (!(Test-Path $debugger)) {
-            $installer = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
-            Invoke-WebRequest 'https://download.microsoft.com/download/4/2/2/42245968-6A79-4DA7-A5FB-08C0AD0AE661/windowssdk/winsdksetup.exe' -OutFile $installer
-            if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne '2E28117E82B4D02FE30D564B835ACE9976612609271265872F20F2256A9C506B') { throw 'Windows SDK installer checksum mismatch' }
-            $install = Start-Process $installer -ArgumentList '/features OptionId.WindowsDesktopDebuggers /quiet /norestart' -Wait -PassThru
-            if ($install.ExitCode -notin @(0, 3010)) { throw "Windows debugger installation failed: $($install.ExitCode)" }
-          }
-          Write-Output "Debugging $binary with $debugger"
-          & $debugger -c 'sxe av;g;kv;dv /t;~*k;q' $binary --exact service::tests::rows_keep_physical_wraps_and_unicode_graphemes --nocapture
       - name: Smoke test executable
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |

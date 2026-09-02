@@ -136,6 +136,9 @@ to the complete response including metadata.
 
 ## Verification
 
+Install Rust 1.90.0 and Zig 0.16.0. The Ghostty bindings are pinned to the
+upstream MSVC static-link fix until it is available in a crates.io release.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -149,7 +152,9 @@ printf 'demo\nlist\nquit\n' | cargo run -- play
 (`windows-2025`) and ARM64 (`windows-11-arm`). It runs on pull requests and
 pushes to `master` or `windows-*` branches, independently of the release workflow.
 It checks formatting, builds the executable, runs all enabled tests, and checks
-`opencode-pty.exe --version`. It does not publish packages or releases.
+`opencode-pty.exe --version`. It also copies the library test executable out of
+the build tree and runs it without Cargo's DLL search paths, verifying that
+libghostty is statically linked. It does not publish packages or releases.
 
 The current service, ownership, playground, and rows integration suites are
 Unix-only. A green Windows job verifies compilation and the enabled parser and
