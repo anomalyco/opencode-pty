@@ -1,0 +1,93 @@
+name: Windows
+
+on:
+  push:
+    branches:
+      - master
+      - "windows-*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      RUSTUP_TOOLCHAIN: 1.90.0-${{ matrix.target }}
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        with:
+          version: 0.15.2
+          cache-key: ${{ matrix.target }}
+      - name: Install native Rust toolchain
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
+      - name: Verify native architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          Write-Output "Windows architecture: $arch"
+          if ($arch -ine $env:EXPECTED_ARCH) { throw "Expected native $env:EXPECTED_ARCH runner, got $arch" }
+          $compiler = rustc -vV
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $compiler
+          if ($compiler -notcontains "host: $env:CARGO_BUILD_TARGET") { throw "Rust host does not match the native target" }
+          zig version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: windows-${{ matrix.target }}-zig-0.15.2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Build executable
+        run: cargo build --locked
+      - name: Run tests
+        timeout-minutes: 10
+        run: cargo test --locked --all-targets --all-features
+      - name: Smoke test executable
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'opencode-pty').version
+          $binary = Join-Path $metadata.target_directory "$env:CARGO_BUILD_TARGET/debug/opencode-pty.exe"
+          $output = & $binary --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output $output
+          if ($output -ne "opencode-pty $version (protocol 7)") { throw "Unexpected executable version: $output" }
+      - name: Document current coverage
+        if: always()
+        run: |
+          @"
+          ## Windows ${{ matrix.arch }}
+
+          Target: $env:CARGO_BUILD_TARGET
+
+          This job builds the executable and runs all enabled tests natively, including libghostty parser and protocol tests.
+          The existing service, ownership, playground, and rows integration suites are Unix-only; they do not exercise Windows yet.
+          A passing run does not imply Windows named-pipe transport or ConPTY lifecycle support is implemented.
+          No packages or releases are published.
+          "@ >> $env:GITHUB_STEP_SUMMARY

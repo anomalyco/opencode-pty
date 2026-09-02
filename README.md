@@ -143,6 +143,26 @@ cargo test
 printf 'demo\nlist\nquit\n' | cargo run -- play
 ```
 
+### Windows CI
+
+`.github/workflows/windows.yml` builds and tests natively on Windows x64
+(`windows-2025`) and ARM64 (`windows-11-arm`). It runs on pull requests and
+pushes to `master` or `windows-*` branches, independently of the release workflow.
+It checks formatting, builds the executable, runs all enabled tests, and checks
+`opencode-pty.exe --version`. It does not publish packages or releases.
+
+The current service, ownership, playground, and rows integration suites are
+Unix-only. A green Windows job verifies compilation and the enabled parser and
+protocol tests, not working Windows transport or ConPTY lifecycle support.
+
+Once the workflow is on `master`, it can also be run manually against a branch:
+
+```sh
+gh workflow run windows.yml --repo anomalyco/opencode-pty --ref windows-ci
+gh run list --repo anomalyco/opencode-pty --workflow windows.yml --branch windows-ci
+gh run view RUN_ID --repo anomalyco/opencode-pty --log-failed
+```
+
 ## Releases
 
 Pushing a `vX.Y.Z` tag matching the version in `Cargo.toml` creates an unsigned
