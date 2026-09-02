@@ -82,6 +82,9 @@ jobs:
           $artifacts = cargo test --locked --lib --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $binary = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }).executable
+          $paths = $artifacts | Where-Object reason -eq 'build-script-executed' | ForEach-Object linked_paths | ForEach-Object { $_ -replace '^[a-z]+=', '' }
+          Write-Output $paths
+          $env:PATH = ($paths -join ';') + ';' + $env:PATH
           $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
           if (!(Test-Path $debugger)) {
             $installer = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
