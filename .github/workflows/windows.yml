@@ -75,6 +75,20 @@ jobs:
         if: failure() && steps.tests.outcome == 'failure'
         timeout-minutes: 10
         run: cargo test --locked --lib --all-features -- --test-threads=1 --nocapture
+      - name: Debug Windows parser crash
+        if: failure() && steps.tests.outcome == 'failure'
+        timeout-minutes: 10
+        run: |
+          $artifacts = cargo test --locked --lib --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binary = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }).executable
+          $debugger = 'C:\Program Files\LLVM\bin\lldb.exe'
+          if (Test-Path $debugger) {
+            & $debugger --batch -o run -o 'thread backtrace all' -o 'register read' -- $binary --exact service::tests::rows_keep_physical_wraps_and_unicode_graphemes --nocapture
+          } else {
+            Write-Output 'LLDB is unavailable; checking installed Windows SDK debuggers'
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers' -Filter cdb.exe -Recurse -ErrorAction SilentlyContinue
+          }
       - name: Smoke test executable
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |

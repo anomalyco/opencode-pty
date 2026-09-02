@@ -1434,7 +1434,9 @@ mod tests {
             max_scrollback: 2 * 1024 * 1024,
         })
         .unwrap();
+        eprintln!("rows_terminal: writing {} bytes", input.len());
         terminal.vt_write(input.as_bytes());
+        eprintln!("rows_terminal: write complete");
         terminal
     }
 
@@ -1474,13 +1476,16 @@ mod tests {
 
     #[test]
     fn rows_keep_physical_wraps_and_unicode_graphemes() {
+        eprintln!("unicode rows: ASCII setup");
         let terminal = rows_terminal(4, 3, "abcdefghij");
         assert_eq!(
             format_rows(&terminal, None).unwrap(),
             ["abcd", "efgh", "ij"]
         );
         assert_eq!(format_rows(&terminal, Some(2)).unwrap(), ["efgh", "ij"]);
+        eprintln!("unicode rows: Unicode setup");
         let terminal = rows_terminal(4, 3, "a\u{301}\u{754c}bc");
+        eprintln!("unicode rows: formatting");
         assert_eq!(
             format_rows(&terminal, None).unwrap(),
             ["a\u{301}\u{754c}b", "c", ""]
