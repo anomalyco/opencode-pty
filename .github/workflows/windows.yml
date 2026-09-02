@@ -71,6 +71,12 @@ jobs:
         id: tests
         timeout-minutes: 10
         run: cargo test --locked --all-targets --all-features
+      - name: Run parser test without Cargo's DLL search paths
+        run: |
+          $artifacts = cargo test --locked --lib --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binary = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }).executable
+          & $binary --exact service::tests::rows_keep_physical_wraps_and_unicode_graphemes --nocapture
       - name: Diagnose failed library tests
         if: failure() && steps.tests.outcome == 'failure'
         timeout-minutes: 10

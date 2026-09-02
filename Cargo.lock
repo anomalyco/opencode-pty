@@ -221,6 +221,7 @@ dependencies = [
  "fs2",
  "libc",
  "libghostty-vt",
+ "libghostty-vt-sys",
  "nix",
  "portable-pty",
  "rand",

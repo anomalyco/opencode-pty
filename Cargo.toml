@@ -24,6 +24,9 @@ libc = "0.2"
 nix = { version = "0.28", features = ["process", "term", "user"] }
 sha2 = "0.10"
 
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+libghostty-vt-sys = "=0.2.1"
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
