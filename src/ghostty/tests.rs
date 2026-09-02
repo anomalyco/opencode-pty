@@ -63,19 +63,30 @@ fn formatted_bytes_outlive_the_native_terminal() {
 #[test]
 fn callback_panics_are_resumed_outside_the_c_boundary() {
     let mut terminal = terminal();
-    let borrow = terminal.effects.writes.borrow_mut();
-    // Deliberately provoke a RefCell panic inside the callback. It must return
-    // normally to C; the wrapper resumes the panic later in Rust.
-    unsafe {
-        write_pty(
-            terminal.raw.as_ptr(),
-            ptr::from_ref(terminal.effects.as_ref()).cast_mut().cast(),
-            b"x".as_ptr(),
-            1,
-        )
-    };
-    drop(borrow);
-    assert!(catch_unwind(AssertUnwindSafe(|| terminal.vt_write(b""))).is_err());
+    for resize in [false, true] {
+        let borrow = terminal.effects.writes.borrow_mut();
+        // Deliberately provoke a RefCell panic inside the callback. It must return
+        // normally to C; either mutating wrapper resumes the panic later in Rust.
+        unsafe {
+            write_pty(
+                terminal.raw.as_ptr(),
+                ptr::from_ref(terminal.effects.as_ref()).cast_mut().cast(),
+                b"x".as_ptr(),
+                1,
+            )
+        };
+        drop(borrow);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                if resize {
+                    terminal.resize(30, 10).unwrap();
+                } else {
+                    terminal.vt_write(b"");
+                }
+            }))
+            .is_err()
+        );
+    }
     terminal.vt_write(b"\x1b[5n");
     assert_eq!(
         terminal.take_writes(),

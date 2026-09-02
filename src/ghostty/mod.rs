@@ -94,6 +94,10 @@ impl Terminal {
         // SAFETY: the byte slice lives through this synchronous call, and &mut self
         // excludes other native operations. No callback can access this Rust wrapper.
         unsafe { ffi::ghostty_terminal_vt_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        self.resume_callback_panic();
+    }
+
+    fn resume_callback_panic(&self) {
         // Any Rust panic is resumed only after returning across the C boundary.
         if let Some(payload) = self.effects.panic.take() {
             resume_unwind(payload);
@@ -118,6 +122,10 @@ impl Terminal {
             return Ok(String::new());
         }
         ensure!(!value.ptr.is_null(), "Ghostty returned a null title");
+        ensure!(
+            value.len <= isize::MAX as usize,
+            "Ghostty title is too large"
+        );
         // SAFETY: Ghostty owns these bytes until the next mutating call, excluded by &self.
         Ok(
             std::str::from_utf8(unsafe { std::slice::from_raw_parts(value.ptr, value.len) })?
@@ -128,7 +136,10 @@ impl Terminal {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         ensure!(cols > 0 && rows > 0, "terminal dimensions must be positive");
         // SAFETY: a live actor-local handle with valid dimensions and no borrowed grid refs.
-        check(unsafe { ffi::ghostty_terminal_resize(self.raw.as_ptr(), cols, rows, 0, 0) })
+        let result = unsafe { ffi::ghostty_terminal_resize(self.raw.as_ptr(), cols, rows, 0, 0) };
+        // Resize can emit in-band size reports through the same PTY callback.
+        self.resume_callback_panic();
+        check(result)
     }
 
     pub fn cols(&self) -> Result<u16> {
@@ -180,14 +191,18 @@ impl Terminal {
                 &mut len,
             )
         })?;
+        ensure!(
+            len == 0 || !ptr.is_null(),
+            "Ghostty returned a null formatted buffer"
+        );
+        ensure!(
+            len <= isize::MAX as usize,
+            "Ghostty formatted buffer is too large"
+        );
         let bytes = Allocation { ptr, len };
         if bytes.len == 0 {
             return Ok(Vec::new());
         }
-        ensure!(
-            !bytes.ptr.is_null(),
-            "Ghostty returned a null formatted buffer"
-        );
         // SAFETY: Ghostty allocated len bytes; copy before the allocation guard frees them.
         Ok(unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec())
     }
