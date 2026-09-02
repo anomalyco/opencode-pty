@@ -76,19 +76,22 @@ jobs:
         timeout-minutes: 10
         run: cargo test --locked --lib --all-features -- --test-threads=1 --nocapture
       - name: Debug Windows parser crash
-        if: failure() && steps.tests.outcome == 'failure'
+        if: failure() && steps.tests.outcome == 'failure' && matrix.arch == 'x64'
         timeout-minutes: 10
         run: |
           $artifacts = cargo test --locked --lib --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $binary = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }).executable
-          $debugger = 'C:\Program Files\LLVM\bin\lldb.exe'
-          if (Test-Path $debugger) {
-            & $debugger --batch -o run -o 'thread backtrace all' -o 'register read' -- $binary --exact service::tests::rows_keep_physical_wraps_and_unicode_graphemes --nocapture
-          } else {
-            Write-Output 'LLDB is unavailable; checking installed Windows SDK debuggers'
-            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers' -Filter cdb.exe -Recurse -ErrorAction SilentlyContinue
+          $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (!(Test-Path $debugger)) {
+            $installer = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
+            Invoke-WebRequest 'https://download.microsoft.com/download/4/2/2/42245968-6A79-4DA7-A5FB-08C0AD0AE661/windowssdk/winsdksetup.exe' -OutFile $installer
+            if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne '2E28117E82B4D02FE30D564B835ACE9976612609271265872F20F2256A9C506B') { throw 'Windows SDK installer checksum mismatch' }
+            $install = Start-Process $installer -ArgumentList '/features OptionId.WindowsDesktopDebuggers /quiet /norestart' -Wait -PassThru
+            if ($install.ExitCode -notin @(0, 3010)) { throw "Windows debugger installation failed: $($install.ExitCode)" }
           }
+          Write-Output "Debugging $binary with $debugger"
+          & $debugger -c 'sxe av;g;kv;dv /t;~*k;q' $binary --exact service::tests::rows_keep_physical_wraps_and_unicode_graphemes --nocapture
       - name: Smoke test executable
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
