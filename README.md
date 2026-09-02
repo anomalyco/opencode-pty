@@ -154,8 +154,9 @@ job uses x64-hosted compilers targeting ARM64 because native ARM64 Zig 0.16
 crashes while building Ghostty; the tests themselves remain native ARM64.
 The job also applies a guarded one-line alignment fix to Zig 0.16's Windows
 stack-trace helper, which otherwise fails to compile for ARM64.
-It runs on pull requests and
-pushes to `master` or `windows-*` branches, independently of the release workflow.
+It runs on pull requests (including subsequent branch pushes) and pushes to
+`master`, independently of the release workflow. Feature branches use the PR
+trigger rather than running duplicate push and PR jobs.
 It checks formatting, builds the executable, runs all enabled tests, and checks
 `opencode-pty.exe --version`. It also copies the library test executable out of
 the build tree and runs it without Cargo's DLL search paths, verifying that
