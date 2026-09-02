@@ -136,8 +136,8 @@ to the complete response including metadata.
 
 ## Verification
 
-Install Rust 1.90.0 and Zig 0.16.0. The Ghostty bindings are pinned to the
-upstream MSVC static-link fix until it is available in a crates.io release.
+Install Git, Rust 1.90.0, and Zig 0.16.0. Normal builds do not need bindgen or
+libclang and do not depend on a third-party Ghostty Rust crate.
 
 ```sh
 cargo fmt --check
@@ -145,6 +145,38 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 printf 'demo\nlist\nquit\n' | cargo run -- play
 ```
+
+### Direct Ghostty bindings
+
+`ghostty-revision` pins the official [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty)
+source. `build.rs` fetches that commit, builds libghostty with Zig 0.16, and
+links its static archive (`ghostty-vt-static.lib` on Windows, not the DLL
+import library). It uses an isolated checkout under Cargo's build directory.
+Set `GHOSTTY_SOURCE_DIR` to reuse a checkout at that exact revision; modified
+C headers are rejected to avoid silently mismatching the generated bindings.
+
+`src/ghostty/ffi.rs` contains a generated subset of the official C API, with
+layout assertions for the supported 64-bit platforms. `src/ghostty/mod.rs`
+owns the terminal/formatter handles and exposes only the operations this
+service uses. It keeps native objects actor-local, copies callback data,
+defers title queries until parsing returns, catches callback panics before
+they can unwind through C, and frees native buffers with Ghostty's allocator.
+No borrowed grid reference or native handle is exposed to the service.
+
+To update the native revision, edit `ghostty-revision`, check out that revision
+of official Ghostty, and regenerate the declarations from its headers:
+
+```sh
+cargo install bindgen-cli --version 0.72.1 --locked
+# Install libclang (or set LIBCLANG_PATH to its shared library directory).
+script/ghostty-bindings /path/to/ghostty
+cargo test --locked
+```
+
+Only regeneration needs bindgen/libclang. The build verifies that the
+generated revision matches `ghostty-revision`; changing either alone fails
+instead of silently combining different C APIs. The generated declarations
+are covered by the upstream license in `src/ghostty/LICENSE`.
 
 ### Windows CI
 
