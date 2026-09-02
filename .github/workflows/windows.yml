@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-${{ github.head_ref || github.ref }}
+  group: windows-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -61,14 +61,22 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows-${{ matrix.target }}-zig-0.15.2
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --check
       - name: Build executable
+        id: build
         run: cargo build --locked
       - name: Run tests
+        id: tests
         timeout-minutes: 10
         run: cargo test --locked --all-targets --all-features
+      - name: Diagnose failed library tests
+        if: failure() && steps.tests.outcome == 'failure'
+        timeout-minutes: 10
+        run: cargo test --locked --lib --all-features -- --test-threads=1 --nocapture
       - name: Smoke test executable
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
