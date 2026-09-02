@@ -136,11 +136,42 @@ to the complete response including metadata.
 
 ## Verification
 
+Install Rust 1.90.0 and Zig 0.16.0. The Ghostty bindings are pinned to the
+upstream MSVC static-link fix until it is available in a crates.io release.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 printf 'demo\nlist\nquit\n' | cargo run -- play
+```
+
+### Windows CI
+
+`.github/workflows/windows.yml` builds for Windows x64 and ARM64 and executes
+tests natively on `windows-2025` and `windows-11-arm`, respectively. The ARM64
+job uses x64-hosted compilers targeting ARM64 because native ARM64 Zig 0.16
+crashes while building Ghostty; the tests themselves remain native ARM64.
+The job also applies a guarded one-line alignment fix to Zig 0.16's Windows
+stack-trace helper, which otherwise fails to compile for ARM64.
+It runs on pull requests (including subsequent branch pushes) and pushes to
+`master`, independently of the release workflow. Feature branches use the PR
+trigger rather than running duplicate push and PR jobs.
+It checks formatting, builds the executable, runs all enabled tests, and checks
+`opencode-pty.exe --version`. It also copies the library test executable out of
+the build tree and runs it without Cargo's DLL search paths, verifying that
+libghostty is statically linked. It does not publish packages or releases.
+
+The current service, ownership, playground, and rows integration suites are
+Unix-only. A green Windows job verifies compilation and the enabled parser and
+protocol tests, not working Windows transport or ConPTY lifecycle support.
+
+Once the workflow is on `master`, it can also be run manually against a branch:
+
+```sh
+gh workflow run windows.yml --repo anomalyco/opencode-pty --ref windows-ci
+gh run list --repo anomalyco/opencode-pty --workflow windows.yml --branch windows-ci
+gh run view RUN_ID --repo anomalyco/opencode-pty --log-failed
 ```
 
 ## Releases
