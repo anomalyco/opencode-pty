@@ -55,7 +55,7 @@ pub fn run() -> Result<()> {
         }
     }
 
-    drop(listener);
+    listener.stop();
     // Unblock partial requests, owner reads, and backpressured subscriptions
     // before joining. PTY workers still use their existing termination path.
     for (cancellation, _) in &handlers {
@@ -76,6 +76,7 @@ pub fn run() -> Result<()> {
     }
     drop(service);
     platform::cleanup(registration)?;
+    drop(listener);
     let _ = cleanup_tx.send(());
     let _ = watchdog.join();
     drop(runtime);

@@ -7,18 +7,21 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, bounded};
 
-pub(crate) struct Listener(UnixListener);
+pub(crate) struct Listener(Option<UnixListener>);
 
 impl Listener {
     pub fn bind(endpoint: &Path) -> io::Result<Self> {
         let listener = UnixListener::bind(endpoint)?;
         listener.set_nonblocking(true)?;
-        Ok(Self(listener))
+        Ok(Self(Some(listener)))
     }
 
     /// Poll for a connection without blocking the daemon control path.
     pub fn accept(&mut self) -> io::Result<Option<Connection>> {
-        match self.0.accept() {
+        let Some(listener) = &self.0 else {
+            return Ok(None);
+        };
+        match listener.accept() {
             Ok((stream, _)) => {
                 // macOS inherits the listener's nonblocking mode on accepted sockets.
                 stream.set_nonblocking(false)?;
@@ -27,6 +30,10 @@ impl Listener {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    pub fn stop(&mut self) {
+        self.0.take();
     }
 }
 
