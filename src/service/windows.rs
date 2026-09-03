@@ -2,14 +2,17 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use portable_pty::{Child, MasterPty};
-use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
+use windows_sys::Win32::{
+    Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{INFINITE, WaitForSingleObject},
+};
 
 use super::ActorMessage;
 
 /// Keep blocking ClosePseudoConsole off the actor/reader without introducing
 /// another worker. The actor hands its unique master here on root exit or on
 /// teardown; closing it then produces the real output-pipe EOF.
-/// Root-exit detection has at most 10 ms polling latency. After reaping, the
+/// Root-exit detection uses a 10 ms poll interval. After reaping, the
 /// worker blocks on the close channel rather than continuing to poll.
 pub(super) fn wait_and_close(
     mut child: Box<dyn Child + Send + Sync>,
@@ -56,7 +59,18 @@ pub(super) fn wait_and_close(
 }
 
 fn report_exit(child: &mut dyn Child, events: &Sender<ActorMessage>) {
-    let result = child.wait().map(|status| Some(status.exit_code()));
+    let result = (|| {
+        if let Some(handle) = child.as_raw_handle() {
+            // SAFETY: this worker owns the child and therefore its wait handle.
+            // GetExitCodeProcess can expose the termination status before the
+            // process object is signaled; portable-pty's wait fast path is not
+            // sufficient to prove that TerminateProcess teardown has finished.
+            if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        child.wait().map(|status| Some(status.exit_code()))
+    })();
     let _ = events.send(ActorMessage::ChildExited(
         result.map_err(|error| error.to_string()),
     ));

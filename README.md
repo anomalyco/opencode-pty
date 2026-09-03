@@ -271,8 +271,8 @@ complete ConPTY shutdown behavior.
 
 On Windows, normal root-child exit hands the ConPTY master to the existing
 child-wait worker for closing. The actor and reader continue draining until the
-real output-pipe EOF; only then is the final exit event published. Detecting the
-root's exit adds at most 10 ms of polling latency. After the master is handed
+real output-pipe EOF; only then is the final exit event published. The worker
+checks the root's wait handle at 10 ms intervals. After the master is handed
 off, Windows input and resize requests fail with a child-exited error; final
 snapshots, rows, and replay remain readable until the terminal is removed.
 Unix post-exit PTY operations retain their existing behavior.
