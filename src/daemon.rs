@@ -18,25 +18,33 @@ pub struct Registration {
 #[cfg(unix)]
 #[path = "daemon/unix.rs"]
 mod platform;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "daemon/windows.rs"]
+mod platform;
+#[cfg(any(unix, windows))]
 mod server;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use platform::{read_registration, registration_path, service_dir};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use server::run;
 
-#[cfg(not(unix))]
+/// Minimal Windows byte-stream client for integrations using protocol framing.
+/// This does not start a daemon or implement the interactive TerminalClient CLI.
+#[cfg(windows)]
+pub use crate::transport::windows::Connection as PipeConnection;
+
+#[cfg(not(any(unix, windows)))]
 pub fn run() -> anyhow::Result<()> {
     anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn read_registration() -> anyhow::Result<Registration> {
     anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn registration_path() -> PathBuf {
     PathBuf::from("opencode-pty-service.json")
 }

@@ -1,7 +1,7 @@
 pub mod client;
 pub mod daemon;
 mod ghostty;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod ownership;
 pub mod protocol;
 pub mod service;
