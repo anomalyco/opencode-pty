@@ -12,7 +12,12 @@ pub(crate) struct Handoff {
     deadline: Instant,
 }
 
-pub(crate) enum Ownership {
+pub(crate) struct Ownership {
+    state: State,
+    generation: u64,
+}
+
+enum State {
     Starting(Instant),
     Owned(Option<Handoff>),
     Waiting(Handoff),
@@ -21,35 +26,49 @@ pub(crate) enum Ownership {
 
 impl Ownership {
     pub fn new(now: Instant) -> Self {
-        Self::Starting(now + ACQUIRE_TIMEOUT)
+        Self {
+            state: State::Starting(now + ACQUIRE_TIMEOUT),
+            generation: 0,
+        }
     }
 
     pub fn tick(&mut self, now: Instant) -> bool {
-        match self {
-            Self::Starting(deadline) if now >= *deadline => *self = Self::Stopped,
-            Self::Waiting(handoff) if now >= handoff.deadline => *self = Self::Stopped,
-            Self::Owned(Some(handoff)) if now >= handoff.deadline => *self = Self::Owned(None),
+        match &self.state {
+            State::Starting(deadline) if now >= *deadline => self.state = State::Stopped,
+            State::Waiting(handoff) if now >= handoff.deadline => self.state = State::Stopped,
+            State::Owned(Some(handoff)) if now >= handoff.deadline => {
+                self.state = State::Owned(None)
+            }
             _ => {}
         }
-        matches!(self, Self::Stopped)
+        matches!(self.state, State::Stopped)
     }
 
-    pub fn claim(&mut self, ticket: Option<&str>, now: Instant) -> Result<()> {
+    pub fn claim(&mut self, ticket: Option<&str>, now: Instant) -> Result<u64> {
         self.tick(now);
-        match &*self {
-            Self::Starting(_) if ticket.is_none() => {}
-            Self::Waiting(handoff) if ticket == Some(handoff.ticket.as_str()) => {}
-            Self::Owned(_) => bail!("daemon already has a live owner"),
-            Self::Stopped => bail!("daemon ownership deadline expired or daemon is stopping"),
+        match &self.state {
+            State::Starting(_) if ticket.is_none() => {}
+            State::Owned(Some(handoff)) | State::Waiting(handoff)
+                if ticket == Some(handoff.ticket.as_str()) => {}
+            State::Owned(_) => bail!("daemon already has a live owner"),
+            State::Stopped => bail!("daemon ownership deadline expired or daemon is stopping"),
             _ => bail!("invalid handoff ticket"),
         }
-        *self = Self::Owned(None);
-        Ok(())
+        self.generation += 1;
+        self.state = State::Owned(None);
+        Ok(self.generation)
     }
 
-    pub fn prepare(&mut self, now: Instant, unix_ms: u64) -> Result<Handoff> {
+    pub fn is_owner(&self, generation: u64) -> bool {
+        self.generation == generation && matches!(self.state, State::Owned(_))
+    }
+
+    pub fn prepare(&mut self, generation: u64, now: Instant, unix_ms: u64) -> Result<Handoff> {
         self.tick(now);
-        let Self::Owned(handoff) = self else {
+        if self.generation != generation {
+            bail!("handoff requires the owner connection");
+        }
+        let State::Owned(handoff) = &mut self.state else {
             bail!("handoff requires the owner connection");
         };
         Ok(handoff
@@ -61,11 +80,15 @@ impl Ownership {
             .clone())
     }
 
-    pub fn disconnect(&mut self, now: Instant) {
+    pub fn disconnect(&mut self, generation: u64, now: Instant) {
+        // A ticket may transfer ownership before the previous connection closes.
+        if !self.is_owner(generation) {
+            return;
+        }
         self.tick(now);
-        *self = match self {
-            Self::Owned(Some(handoff)) => Self::Waiting(handoff.clone()),
-            _ => Self::Stopped,
+        self.state = match &self.state {
+            State::Owned(Some(handoff)) => State::Waiting(handoff.clone()),
+            _ => State::Stopped,
         };
     }
 }
@@ -79,9 +102,9 @@ mod tests {
         let now = Instant::now();
         let mut owner = Ownership::new(now);
         assert!(owner.claim(Some("unexpected"), now).is_err());
-        owner.claim(None, now).unwrap();
+        let generation = owner.claim(None, now).unwrap();
         assert!(owner.claim(None, now).is_err());
-        owner.disconnect(now);
+        owner.disconnect(generation, now);
         assert!(owner.tick(now));
         assert!(owner.claim(None, now).is_err());
 
@@ -95,22 +118,51 @@ mod tests {
     fn handoff_is_nonrenewing_and_consumed_by_claim() {
         let now = Instant::now();
         let mut owner = Ownership::new(now);
-        owner.claim(None, now).unwrap();
-        let handoff = owner.prepare(now, 1000).unwrap();
+        let generation = owner.claim(None, now).unwrap();
+        let handoff = owner.prepare(generation, now, 1000).unwrap();
         assert_eq!(handoff.expires_at, 121_000);
         assert_eq!(
             owner
-                .prepare(now + Duration::from_secs(60), 61_000)
+                .prepare(generation, now + Duration::from_secs(60), 61_000)
                 .unwrap(),
             handoff
         );
-        assert!(owner.claim(Some(&handoff.ticket), now).is_err());
-        owner.disconnect(now);
+        owner.disconnect(generation, now);
         assert!(owner.claim(None, now).is_err());
         assert!(owner.claim(Some("wrong"), now).is_err());
-        owner.claim(Some(&handoff.ticket), now).unwrap();
+        let successor = owner.claim(Some(&handoff.ticket), now).unwrap();
         assert!(owner.claim(Some(&handoff.ticket), now).is_err());
-        owner.disconnect(now);
+        owner.disconnect(successor, now);
+        assert!(owner.tick(now));
+    }
+
+    #[test]
+    fn valid_ticket_replaces_live_owner_and_fences_old_connection() {
+        let now = Instant::now();
+        let mut owner = Ownership::new(now);
+        let generation = owner.claim(None, now).unwrap();
+        let handoff = owner.prepare(generation, now, 1000).unwrap();
+        assert!(owner.claim(None, now).is_err());
+        assert!(owner.claim(Some("wrong"), now).is_err());
+        assert!(owner.is_owner(generation));
+
+        let successor = owner.claim(Some(&handoff.ticket), now).unwrap();
+        assert!(!owner.is_owner(generation));
+        assert!(owner.is_owner(successor));
+        assert!(owner.claim(Some(&handoff.ticket), now).is_err());
+        assert!(owner.prepare(generation, now, 1000).is_err());
+        owner.disconnect(generation, now);
+        assert!(owner.is_owner(successor));
+        assert!(!owner.tick(now));
+
+        let next = owner.prepare(successor, now, 1000).unwrap();
+        owner.disconnect(generation, now);
+        assert!(owner.is_owner(successor));
+        owner.disconnect(successor, now);
+        // Stale cleanup must not discard the successor's pending handoff either.
+        owner.disconnect(generation, now);
+        let last = owner.claim(Some(&next.ticket), now).unwrap();
+        owner.disconnect(last, now);
         assert!(owner.tick(now));
     }
 
@@ -118,17 +170,23 @@ mod tests {
     fn expiry_only_stops_a_disconnected_owner() {
         let now = Instant::now();
         let mut owner = Ownership::new(now);
-        owner.claim(None, now).unwrap();
-        let handoff = owner.prepare(now, 1000).unwrap();
+        let generation = owner.claim(None, now).unwrap();
+        let handoff = owner.prepare(generation, now, 1000).unwrap();
         assert!(!owner.tick(handoff.deadline));
-        assert!(matches!(owner, Ownership::Owned(None)));
-        owner.disconnect(handoff.deadline);
+        assert!(matches!(owner.state, State::Owned(None)));
+        assert!(
+            owner
+                .claim(Some(&handoff.ticket), handoff.deadline)
+                .is_err()
+        );
+        assert!(owner.is_owner(generation));
+        owner.disconnect(generation, handoff.deadline);
         assert!(owner.tick(handoff.deadline));
 
         let mut owner = Ownership::new(now);
-        owner.claim(None, now).unwrap();
-        let handoff = owner.prepare(now, 1000).unwrap();
-        owner.disconnect(now);
+        let generation = owner.claim(None, now).unwrap();
+        let handoff = owner.prepare(generation, now, 1000).unwrap();
+        owner.disconnect(generation, now);
         assert!(!owner.tick(handoff.deadline - Duration::from_millis(1)));
         assert!(
             owner
