@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use opencode_pty::protocol::AttachmentRole;
-use opencode_pty::service::{StreamEvent, TerminalId, TerminalService, TerminalSnapshot};
+use opencode_pty::service::{
+    StreamEvent, TerminalId, TerminalLifecycle, TerminalService, TerminalSnapshot,
+};
 use terminal_fixture::{Command, Deadline, Fixture, TempDir};
 
 fn wait_text(service: &TerminalService, id: TerminalId, expected: &str) -> TerminalSnapshot {
@@ -230,4 +232,149 @@ fn independent_terminals_keep_bounded_replay() {
     );
     service.terminate(beta.id).unwrap();
     assert!(service.list().unwrap().is_empty());
+}
+
+#[test]
+fn normal_exit_follows_final_output_and_preserves_exit_code() {
+    let _deadline = Deadline::new();
+    let fixture = Fixture::new();
+    let service = TerminalService::default();
+    let info = service.create(fixture.request()).unwrap();
+    let mut child = fixture.connect();
+    let observer = service
+        .attach(
+            info.id,
+            0,
+            "exit-observer".into(),
+            AttachmentRole::Observer,
+            false,
+        )
+        .unwrap();
+    let mut bytes = observer.replay.bytes.clone();
+    let mut offset = observer.replay.end_offset;
+    child.command(Command::Output("\r\nFINAL_OUTPUT_BEFORE_EXIT\r\n".into()));
+    child.command(Command::Exit(23));
+    loop {
+        match observer
+            .events
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "missing exit event: {error}; snapshot={:?}",
+                    service.snapshot(info.id)
+                )
+            }) {
+            StreamEvent::Output {
+                start,
+                end,
+                bytes: output,
+            } => {
+                assert_eq!(start, offset);
+                assert_eq!(end - start, output.len() as u64);
+                bytes.extend(output);
+                offset = end;
+            }
+            StreamEvent::Exited {
+                exit_code,
+                final_offset,
+            } => {
+                assert_eq!(exit_code, Some(23));
+                assert_eq!(final_offset, offset);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(service.replay(info.id, 0).unwrap().bytes, bytes);
+    let snapshot = service.snapshot(info.id).unwrap();
+    assert!(
+        snapshot.text.contains("FINAL_OUTPUT_BEFORE_EXIT"),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.info.lifecycle,
+        TerminalLifecycle::Exited {
+            exit_code: Some(23)
+        }
+    );
+    assert_eq!(snapshot.info.output_tail, offset);
+    assert!(observer.events.try_recv().is_err());
+    drop(observer);
+    service.terminate(info.id).unwrap();
+}
+
+#[test]
+fn repeated_termination_and_drop_release_nonreading_children() {
+    let _deadline = Deadline::new();
+    let service = TerminalService::default();
+    for _ in 0..3 {
+        let fixture = Fixture::new();
+        let info = service.create(fixture.request()).unwrap();
+        let _child = fixture.connect();
+        let process = ChildProcess::open(info.pid.unwrap());
+        // Child waits on the private control channel, never draining PTY stdin.
+        service.write(info.id, vec![b'x'; 256 * 1024]).unwrap();
+        service.terminate(info.id).unwrap();
+        process.assert_exited();
+        assert!(service.list().unwrap().is_empty());
+        assert!(service.terminate(info.id).is_err());
+    }
+    let fixture = Fixture::new();
+    let info = service.create(fixture.request()).unwrap();
+    let _child = fixture.connect();
+    let process = ChildProcess::open(info.pid.unwrap());
+    service.write(info.id, vec![b'x'; 256 * 1024]).unwrap();
+    drop(service);
+    process.assert_exited();
+}
+
+struct ChildProcess {
+    #[cfg(unix)]
+    pid: u32,
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+impl ChildProcess {
+    fn open(pid: u32) -> Self {
+        #[cfg(unix)]
+        {
+            Self { pid }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+            // SAFETY: request only wait access to this known-live test child.
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+            Self {
+                handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+            }
+        }
+    }
+
+    fn assert_exited(&self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: signal zero checks liveness without signalling a process.
+            assert_eq!(unsafe { libc::kill(self.pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{
+                Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
+            };
+            // SAFETY: the owned process handle has wait access and stays live.
+            assert_eq!(
+                unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) },
+                WAIT_OBJECT_0
+            );
+        }
+    }
 }
