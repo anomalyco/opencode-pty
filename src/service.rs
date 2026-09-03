@@ -1,24 +1,19 @@
-use std::cell::RefCell;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::selection::Selection;
-use libghostty_vt::terminal::{Point, PointCoordinate};
-use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
+use crate::ghostty::{Format, Terminal, TerminalOptions};
 use crate::protocol::AttachmentRole;
 
 const DEFAULT_COLS: u16 = 100;
@@ -692,24 +687,10 @@ fn run_actor(config: ActorConfig) -> Result<()> {
         rows,
         init_tx,
     } = config;
-    let responses = Rc::new(RefCell::new(VecDeque::<Vec<u8>>::new()));
-    let title = Rc::new(RefCell::new(None::<String>));
     let mut terminal = Terminal::new(TerminalOptions {
         cols,
         rows,
         max_scrollback: replay_capacity,
-    })?;
-    terminal.on_pty_write({
-        let responses = Rc::clone(&responses);
-        move |_terminal, data| responses.borrow_mut().push_back(data.to_vec())
-    })?;
-    terminal.on_title_changed({
-        let title = Rc::clone(&title);
-        move |terminal| {
-            if let Ok(value) = terminal.title() {
-                *title.borrow_mut() = Some(value.to_owned());
-            }
-        }
     })?;
 
     let mut replay = ReplayBuffer::new(replay_capacity);
@@ -737,11 +718,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
-                while let Some(response) = responses.borrow_mut().pop_front() {
-                    writes
-                        .send(WriterMessage::Bytes(response))
-                        .map_err(|_| anyhow!("terminal writer stopped"))?;
-                }
+                forward_replies(&mut terminal, &writes)?;
                 update_offsets(&info, &replay);
                 broadcast(
                     &mut subscribers,
@@ -749,7 +726,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     &mut controller_generation,
                     StreamEvent::Output { start, end, bytes },
                 );
-                if let Some(title) = title.borrow_mut().take() {
+                if let Some(title) = terminal.take_title() {
                     let changed = if let Ok(mut value) = info.write() {
                         if value.title == title {
                             false
@@ -797,7 +774,9 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         pixel_width: 0,
                         pixel_height: 0,
                     })?;
-                    terminal.resize(cols, rows, 0, 0)?;
+                    let resized = terminal.resize(cols, rows);
+                    forward_replies(&mut terminal, &writes)?;
+                    resized?;
                     if let Ok(mut value) = info.write() {
                         value.cols = cols;
                         value.rows = rows;
@@ -864,7 +843,9 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                             pixel_width: 0,
                             pixel_height: 0,
                         })?;
-                        terminal.resize(cols, rows, 0, 0)?;
+                        let resized = terminal.resize(cols, rows);
+                        forward_replies(&mut terminal, &writes)?;
+                        resized?;
                         if let Ok(mut value) = info.write() {
                             value.cols = cols;
                             value.rows = rows;
@@ -1173,6 +1154,18 @@ fn process_depth(pid: i32, parents: &HashMap<i32, i32>) -> usize {
     seen.len()
 }
 
+// Forward effects immediately after each native mutation, even if it reports an
+// error. In particular, resize notifications must precede any accompanying input.
+// Actual PTY I/O remains on the single writer thread, never inside a callback.
+fn forward_replies(terminal: &mut Terminal, writes: &Sender<WriterMessage>) -> Result<()> {
+    for response in terminal.take_writes() {
+        writes
+            .send(WriterMessage::Bytes(response))
+            .map_err(|_| anyhow!("terminal writer stopped"))?;
+    }
+    Ok(())
+}
+
 fn run_writer(
     mut writer: Box<dyn Write + Send>,
     writer_rx: Receiver<WriterMessage>,
@@ -1190,7 +1183,7 @@ fn run_writer(
 }
 
 fn make_snapshot(
-    terminal: &Terminal<'_, '_>,
+    terminal: &Terminal,
     info: &Arc<RwLock<TerminalInfo>>,
 ) -> Result<TerminalSnapshot> {
     let text = format_terminal(terminal, Format::Plain)?;
@@ -1208,7 +1201,7 @@ fn make_snapshot(
     })
 }
 
-fn format_rows(terminal: &Terminal<'_, '_>, rows: Option<u16>) -> Result<Vec<String>> {
+fn format_rows(terminal: &Terminal, rows: Option<u16>) -> Result<Vec<String>> {
     let rows = rows.unwrap_or(terminal.rows()?);
     if rows == 0 {
         bail!("row count must be positive");
@@ -1222,25 +1215,11 @@ fn format_rows(terminal: &Terminal<'_, '_>, rows: Option<u16>) -> Result<Vec<Str
     }
     let mut lines = Vec::with_capacity(count);
     let mut buffer = vec![0; MAX_ROWS_BYTES - bytes];
-    let cols = terminal.cols()?;
     for y in total - count..total {
         let y = u32::try_from(y).context("terminal row index exceeds u32")?;
-        let selection = Selection::new(
-            terminal.grid_ref(Point::Screen(PointCoordinate { x: 0, y }))?,
-            terminal.grid_ref(Point::Screen(PointCoordinate { x: cols - 1, y }))?,
-            false,
-        );
         // A single-row selection preserves blank rows without joining soft wraps.
-        let mut formatter = Formatter::new(
-            terminal,
-            FormatterOptions::new()
-                .with_format(Format::Plain)
-                .with_unwrap(false)
-                .with_trim(true)
-                .with_selection(&selection),
-        )?;
-        let len = formatter
-            .format_buf(&mut buffer[..MAX_ROWS_BYTES - bytes])
+        let len = terminal
+            .format_row(y, &mut buffer[..MAX_ROWS_BYTES - bytes])
             .with_context(|| {
                 format!("rows exceed {MAX_ROWS_BYTES} byte limit or formatting failed")
             })?;
@@ -1254,24 +1233,8 @@ fn format_rows(terminal: &Terminal<'_, '_>, rows: Option<u16>) -> Result<Vec<Str
     Ok(lines)
 }
 
-fn format_terminal(terminal: &Terminal<'_, '_>, format: Format) -> Result<String> {
-    let options = FormatterOptions::new()
-        .with_format(format)
-        .with_unwrap(false)
-        .with_trim(true)
-        .with_modes(true)
-        .with_scrolling_region(true)
-        .with_tabstops(true)
-        .with_pwd(true)
-        .with_keyboard(true)
-        .with_cursor(false)
-        .with_style(true)
-        .with_hyperlink(true)
-        .with_protection(true)
-        .with_kitty_keyboard(true)
-        .with_charsets(true);
-    let mut formatter = Formatter::new(terminal, options)?;
-    let bytes = formatter.format_alloc(None)?;
+fn format_terminal(terminal: &Terminal, format: Format) -> Result<String> {
+    let bytes = terminal.format(format)?;
     let output = String::from_utf8_lossy(bytes.as_ref()).into_owned();
     if format != Format::Vt {
         return Ok(output);
@@ -1427,7 +1390,7 @@ fn default_shell() -> String {
 mod tests {
     use super::*;
 
-    fn rows_terminal(cols: u16, rows: u16, input: &str) -> Terminal<'static, 'static> {
+    fn rows_terminal(cols: u16, rows: u16, input: &str) -> Terminal {
         let mut terminal = Terminal::new(TerminalOptions {
             cols,
             rows,
@@ -1436,6 +1399,29 @@ mod tests {
         .unwrap();
         terminal.vt_write(input.as_bytes());
         terminal
+    }
+
+    #[test]
+    fn forwarding_replies_drains_once_and_reports_writer_failure() {
+        let mut terminal = rows_terminal(10, 3, "\x1b[5n\x1b[6n");
+        let (writes, reader) = bounded(4);
+        forward_replies(&mut terminal, &writes).unwrap();
+        for expected in [b"\x1b[0n".as_slice(), b"\x1b[1;1R".as_slice()] {
+            let WriterMessage::Bytes(bytes) = reader.try_recv().unwrap();
+            assert_eq!(bytes, expected);
+        }
+        assert!(reader.try_recv().is_err());
+        assert!(terminal.take_writes().is_empty());
+
+        terminal.vt_write(b"\x1b[5n");
+        drop(reader);
+        assert_eq!(
+            forward_replies(&mut terminal, &writes)
+                .unwrap_err()
+                .to_string(),
+            "terminal writer stopped",
+        );
+        assert!(terminal.take_writes().is_empty());
     }
 
     #[test]
@@ -1504,12 +1490,12 @@ mod tests {
     #[test]
     fn rows_follow_resize_and_reflow() {
         let mut terminal = rows_terminal(4, 3, "abcdefghij");
-        terminal.resize(6, 4, 0, 0).unwrap();
+        terminal.resize(6, 4).unwrap();
         assert_eq!(
             format_rows(&terminal, None).unwrap(),
             ["abcdef", "ghij", "", ""]
         );
-        terminal.resize(4, 2, 0, 0).unwrap();
+        terminal.resize(4, 2).unwrap();
         assert_eq!(format_rows(&terminal, None).unwrap(), ["efgh", "ij"]);
         assert_eq!(
             format_rows(&terminal, Some(3)).unwrap(),
@@ -1519,24 +1505,10 @@ mod tests {
 
     #[test]
     fn rows_do_not_change_viewport_selection_cursor_or_checkpoint() {
-        use libghostty_vt::selection::FormatOptions;
-        use libghostty_vt::terminal::ScrollViewport;
-
         let mut terminal = rows_terminal(10, 3, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
-        terminal.scroll_viewport(ScrollViewport::Top);
-        let selection = Selection::new(
-            terminal
-                .grid_ref(Point::Screen(PointCoordinate { x: 0, y: 0 }))
-                .unwrap(),
-            terminal
-                .grid_ref(Point::Screen(PointCoordinate { x: 2, y: 0 }))
-                .unwrap(),
-            false,
-        );
-        terminal.set_selection(Some(&selection)).unwrap();
-        let viewport = terminal
-            .grid_ref(Point::Viewport(PointCoordinate { x: 0, y: 0 }))
-            .unwrap();
+        terminal.scroll_to_top();
+        terminal.set_selection((0, 0), (2, 0)).unwrap();
+        let viewport = terminal.viewport_row().unwrap();
         let checkpoint = format_terminal(&terminal, Format::Vt).unwrap();
         let cursor = (terminal.cursor_x().unwrap(), terminal.cursor_y().unwrap());
         assert_eq!(
@@ -1548,17 +1520,9 @@ mod tests {
             (terminal.cursor_x().unwrap(), terminal.cursor_y().unwrap()),
             cursor
         );
-        assert_eq!(
-            terminal
-                .point_from_grid_ref(&viewport, libghostty_vt::terminal::PointSpace::Viewport)
-                .unwrap(),
-            Some(PointCoordinate { x: 0, y: 0 })
-        );
+        assert_eq!(terminal.viewport_row().unwrap(), viewport);
         let mut buffer = [0; 32];
-        let len = terminal
-            .format_selection_buf(FormatOptions::new(), &mut buffer)
-            .unwrap()
-            .unwrap();
+        let len = terminal.selection_text(&mut buffer).unwrap().unwrap();
         assert_eq!(&buffer[..len], b"one");
     }
 
@@ -1610,7 +1574,7 @@ mod tests {
                 })
                 .unwrap();
                 source.vt_write(input.as_bytes());
-                source.resize(cols, rows, 0, 0).unwrap();
+                source.resize(cols, rows).unwrap();
                 let checkpoint = format_terminal(&source, Format::Vt).unwrap();
                 let mut restored = Terminal::new(TerminalOptions {
                     cols,

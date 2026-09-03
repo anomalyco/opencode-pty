@@ -1,11 +1,63 @@
 #![cfg(unix)]
 
+#[path = "support/resize_fixture.rs"]
+mod resize_fixture;
+
 use std::env;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use opencode_pty::service::{CreateTerminal, TerminalLifecycle, TerminalService};
 use opencode_pty::{protocol::AttachmentRole, service::StreamEvent};
+use resize_fixture::ResizeFixture;
+
+#[test]
+fn resize_reports_reach_a_silent_child() {
+    let mut fixture = ResizeFixture::new("resize_reports_reach_a_silent_child");
+    fixture.service.resize(fixture.id, 100, 40).unwrap();
+    fixture.expect_input(b"\x1b[48;40;100;0;0t");
+}
+
+#[test]
+fn control_resize_reports_precede_user_input() {
+    let mut fixture = ResizeFixture::new("control_resize_reports_precede_user_input");
+    let _controller = fixture
+        .service
+        .attach(
+            fixture.id,
+            0,
+            "controller".into(),
+            AttachmentRole::Controller,
+            false,
+        )
+        .unwrap();
+    let _observer = fixture
+        .service
+        .attach(
+            fixture.id,
+            0,
+            "observer".into(),
+            AttachmentRole::Observer,
+            false,
+        )
+        .unwrap();
+    fixture
+        .service
+        .input(fixture.id, "observer".into(), 120, 50, b"typed".to_vec())
+        .unwrap();
+    fixture.expect_input(b"\x1b[48;50;120;0;0ttyped");
+}
+
+#[test]
+fn repeated_resize_reports_are_delivered_once() {
+    let mut fixture = ResizeFixture::new("repeated_resize_reports_are_delivered_once");
+    for (cols, rows) in [(30, 10), (31, 11), (32, 12)] {
+        fixture.service.resize(fixture.id, cols, rows).unwrap();
+        fixture.expect_input(format!("\x1b[48;{rows};{cols};0;0t").as_bytes());
+    }
+    fixture.service.write(fixture.id, b"!".to_vec()).unwrap();
+    fixture.expect_input(b"!\x1b[0n");
+}
 
 fn command(script: &str) -> CreateTerminal {
     CreateTerminal {

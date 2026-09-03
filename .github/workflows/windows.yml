@@ -86,6 +86,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows-${{ matrix.target }}-zig-0.16.0
+          # The native Ghostty build is now an output of the workspace crate.
+          cache-workspace-crates: true
           cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --check

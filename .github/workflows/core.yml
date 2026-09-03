@@ -1,0 +1,62 @@
+name: Core
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    name: Miri (callback ownership)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: target/miri
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Miri
+        run: rustup toolchain install nightly-2026-09-02 --profile minimal --component miri --component rust-src
+      - run: cargo +nightly-2026-09-02 miri setup
+      - name: Check Stacked Borrows
+        run: cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+      - name: Check Tree Borrows
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+        run: cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+
+  test:
+    name: Core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        with:
+          version: 0.16.0
+      - name: Install Rust
+        run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: core-${{ matrix.os }}-zig-0.16.0
+          cache-workspace-crates: true
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test Linux
+        if: runner.os == 'Linux'
+        run: cargo test --locked
+      # Match the release workflow's macOS playground exclusion.
+      - name: Test macOS
+        if: runner.os == 'macOS'
+        run: cargo test --locked --lib --test service --test ownership --test rows --test ghostty-effects
