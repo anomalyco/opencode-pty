@@ -1,19 +1,19 @@
 //! The service's small, actor-local adapter to the official libghostty C API.
 //! Native handles and borrowed grid references never leave this module.
 
+mod effects;
 mod ffi;
 
-use std::any::Any;
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail, ensure};
+
+use effects::Effects;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalOptions {
@@ -28,17 +28,10 @@ pub(crate) enum Format {
     Vt,
 }
 
-#[derive(Default)]
-struct Effects {
-    writes: RefCell<VecDeque<Vec<u8>>>,
-    title_changed: Cell<bool>,
-    panic: Cell<Option<Box<dyn Any + Send>>>,
-}
-
 pub(crate) struct Terminal {
     raw: NonNull<ffi::GhosttyTerminalImpl>,
-    // Ghostty retains this pointee as userdata; moving Terminal must not move it.
-    effects: Box<Effects>,
+    // Shared callback state stays alive until after ghostty_terminal_free.
+    effects: Effects,
     // Creation, access, callbacks, and destruction all belong to one actor thread.
     _actor: PhantomData<Rc<()>>,
 }
@@ -64,27 +57,27 @@ impl Terminal {
         })?;
         let terminal = Self {
             raw: NonNull::new(raw).context("Ghostty returned a null terminal")?,
-            effects: Box::default(),
+            effects: Effects::default(),
             _actor: PhantomData,
         };
 
-        // SAFETY: userdata points into a stable allocation kept until after terminal_free.
+        // SAFETY: userdata is an Rc-derived shared pointer retained until after terminal_free.
         // These callbacks only copy responses/mark a title change; they never reenter Ghostty.
         unsafe {
             check(ffi::ghostty_terminal_set(
                 raw,
                 ffi::GHOSTTY_TERMINAL_OPT_USERDATA,
-                ptr::from_ref(terminal.effects.as_ref()).cast(),
+                terminal.effects.userdata(),
             ))?;
             check(ffi::ghostty_terminal_set(
                 raw,
                 ffi::GHOSTTY_TERMINAL_OPT_WRITE_PTY,
-                write_pty as *const c_void,
+                Effects::write_pty as *const c_void,
             ))?;
             check(ffi::ghostty_terminal_set(
                 raw,
                 ffi::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
-                title_changed as *const c_void,
+                Effects::title_changed as *const c_void,
             ))?;
         }
         Ok(terminal)
@@ -94,22 +87,15 @@ impl Terminal {
         // SAFETY: the byte slice lives through this synchronous call, and &mut self
         // excludes other native operations. No callback can access this Rust wrapper.
         unsafe { ffi::ghostty_terminal_vt_write(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) };
-        self.resume_callback_panic();
-    }
-
-    fn resume_callback_panic(&self) {
-        // Any Rust panic is resumed only after returning across the C boundary.
-        if let Some(payload) = self.effects.panic.take() {
-            resume_unwind(payload);
-        }
+        self.effects.resume_panic();
     }
 
     pub fn take_writes(&mut self) -> VecDeque<Vec<u8>> {
-        std::mem::take(self.effects.writes.get_mut())
+        self.effects.take_writes()
     }
 
     pub fn take_title(&mut self) -> Option<String> {
-        if !self.effects.title_changed.replace(false) {
+        if !self.effects.take_title_changed() {
             return None;
         }
         self.title().ok()
@@ -138,7 +124,7 @@ impl Terminal {
         // SAFETY: a live actor-local handle with valid dimensions and no borrowed grid refs.
         let result = unsafe { ffi::ghostty_terminal_resize(self.raw.as_ptr(), cols, rows, 0, 0) };
         // Resize can emit in-band size reports through the same PTY callback.
-        self.resume_callback_panic();
+        self.effects.resume_panic();
         check(result)
     }
 
@@ -337,46 +323,6 @@ impl Drop for Terminal {
         // SAFETY: this is the sole owner, and effects remain alive until this call finishes.
         unsafe { ffi::ghostty_terminal_free(self.raw.as_ptr()) };
     }
-}
-
-// The registration API takes void pointers; still check our callback signatures
-// against the generated C typedefs at compile time.
-const _: ffi::GhosttyTerminalWritePtyFn = Some(write_pty);
-const _: ffi::GhosttyTerminalTitleChangedFn = Some(title_changed);
-
-unsafe extern "C" fn write_pty(
-    _: ffi::GhosttyTerminal,
-    userdata: *mut c_void,
-    data: *const u8,
-    len: usize,
-) {
-    // SAFETY: installed only by Terminal::new with its stable Effects allocation.
-    let effects = unsafe { &*userdata.cast::<Effects>() };
-    if let Some(payload) = effects.panic.take() {
-        effects.panic.set(Some(payload));
-        return;
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if len == 0 {
-            return;
-        }
-        assert!(!data.is_null() && len <= isize::MAX as usize);
-        // SAFETY: Ghostty guarantees data is valid during this callback. Keep owned bytes only.
-        effects
-            .writes
-            .borrow_mut()
-            .push_back(unsafe { std::slice::from_raw_parts(data, len) }.to_vec());
-    }));
-    if let Err(payload) = result {
-        effects.panic.set(Some(payload));
-    }
-}
-
-unsafe extern "C" fn title_changed(_: ffi::GhosttyTerminal, userdata: *mut c_void) {
-    // SAFETY: the same stable allocation as write_pty. Cell::set cannot panic or reenter Ghostty.
-    unsafe { &*userdata.cast::<Effects>() }
-        .title_changed
-        .set(true);
 }
 
 struct Formatter<'a> {

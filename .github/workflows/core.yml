@@ -14,6 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  miri:
+    name: Miri (callback ownership)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: target/miri
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Miri
+        run: rustup toolchain install nightly-2026-09-02 --profile minimal --component miri --component rust-src
+      - run: cargo +nightly-2026-09-02 miri setup
+      - name: Check Stacked Borrows
+        run: cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+      - name: Check Tree Borrows
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+        run: cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+
   test:
     name: Core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

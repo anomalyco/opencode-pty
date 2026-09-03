@@ -152,6 +152,8 @@ printf 'demo\nlist\nquit\n' | cargo run -- play
 source. `build.rs` fetches that commit, builds libghostty with Zig 0.16, and
 links its static archive (`ghostty-vt-static.lib` on Windows, not the DLL
 import library). It uses an isolated checkout under Cargo's build directory.
+The package declares `links = "ghostty-vt"` so Cargo rejects dependency graphs
+that try to link another native Ghostty owner alongside it.
 Set `GHOSTTY_SOURCE_DIR` to reuse a checkout at that exact revision; modified
 C headers are rejected to avoid silently mismatching the generated bindings.
 
@@ -162,6 +164,12 @@ service uses. It keeps native objects actor-local, copies callback data,
 defers title queries until parsing returns, catches callback panics before
 they can unwind through C, and frees native buffers with Ghostty's allocator.
 No borrowed grid reference or native handle is exposed to the service.
+
+`src/ghostty/effects.rs` owns the callback state through `Rc`. Its retained
+userdata pointer comes from `Rc::as_ptr`, and all state changes use interior
+mutability through shared references. It stays alive through native teardown;
+moving a terminal or draining replies never creates an exclusive borrow of the
+callback allocation.
 
 To update the native revision, edit `ghostty-revision`, check out that revision
 of official Ghostty, and regenerate the declarations from its headers:
@@ -177,6 +185,18 @@ Only regeneration needs bindgen/libclang. The build verifies that the
 generated revision matches `ghostty-revision`; changing either alone fails
 instead of silently combining different C APIs. The generated declarations
 are covered by the upstream license in `src/ghostty/LICENSE`.
+
+The callback ownership tests also run under Miri without building Ghostty. Their
+small native-owner stand-in imports the production effects module directly and
+exercises constructor/container moves, repeated callback/drain cycles, buffer
+ownership, panic handling, and teardown. CI checks both Stacked Borrows and Tree
+Borrows; the regular native suites still verify the actual C integration.
+
+```sh
+rustup toolchain install nightly-2026-09-02 --profile minimal --component miri --component rust-src
+cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+```
 
 ### Windows CI
 

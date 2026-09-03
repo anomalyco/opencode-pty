@@ -1,4 +1,5 @@
 use super::*;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn terminal() -> Terminal {
     Terminal::new(TerminalOptions {
@@ -19,9 +20,13 @@ fn callbacks_survive_moves_and_return_owned_data() {
         VecDeque::from([b"\x1b[0n".to_vec()])
     );
     let title = terminal.take_title().unwrap();
-    terminal.vt_write(b"\x1b]2;second\x07");
+    terminal.vt_write(b"\x1b[5n\x1b]2;second\x07");
     assert_eq!(title, "first");
     assert_eq!(terminal.take_title().as_deref(), Some("second"));
+    assert_eq!(
+        terminal.take_writes(),
+        VecDeque::from([b"\x1b[0n".to_vec()])
+    );
     assert!(terminal.take_title().is_none());
     assert!(terminal.take_writes().is_empty());
 }
@@ -64,18 +69,16 @@ fn formatted_bytes_outlive_the_native_terminal() {
 fn callback_panics_are_resumed_outside_the_c_boundary() {
     let mut terminal = terminal();
     for resize in [false, true] {
-        let borrow = terminal.effects.writes.borrow_mut();
-        // Deliberately provoke a RefCell panic inside the callback. It must return
+        // Deliberately provoke an assertion panic inside the callback. It must return
         // normally to C; either mutating wrapper resumes the panic later in Rust.
         unsafe {
-            write_pty(
+            Effects::write_pty(
                 terminal.raw.as_ptr(),
-                ptr::from_ref(terminal.effects.as_ref()).cast_mut().cast(),
-                b"x".as_ptr(),
+                terminal.effects.userdata().cast_mut(),
+                ptr::null(),
                 1,
             )
         };
-        drop(borrow);
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 if resize {
