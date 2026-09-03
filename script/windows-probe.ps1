@@ -61,7 +61,7 @@ try {
     $env:OPENCODE_PTY_PROBE_SHA256 = $null
     Write-Output "Ephemeral probe SHA256=$digest target=$env:CARGO_BUILD_TARGET"
     # Short compiler diagnostics avoid dumping source snippets into the job log.
-    & cargo test --locked --all-features --test windows-probe --message-format=short -- --nocapture
+    & cargo test --locked --all-features --test windows-probe --message-format=short -- --test-threads=1 --nocapture
     if ($LASTEXITCODE -ne 0) {
         throw "Ephemeral probe failed with exit code $LASTEXITCODE"
     }

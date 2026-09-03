@@ -319,7 +319,9 @@ never execute this path. The hook accepts at most 24,000 encoded characters and
 256 KiB of decompressed, strict UTF-8 source, verifies its SHA-256, and creates
 only the reserved untracked `tests/windows-probe.rs` path (refusing an existing
 entry). After the normal committed tests, it runs that target with a five-minute
-step limit and removes exactly its generated source file in `finally`.
+step limit and removes exactly its generated source file in `finally`. Only this
+optional target runs with `--test-threads=1` to isolate process-wide measurements;
+individual probes may still exercise deliberate concurrency.
 The payload is masked before it enters the step environment; the hook logs its
 digest, target architecture, and results, not its source. Checkout credentials
 are not persisted, workflow permissions stay read-only, and diagnostic runs do
