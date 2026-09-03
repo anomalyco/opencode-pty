@@ -18,11 +18,12 @@ use opencode_pty::protocol::{
     AttachmentRole, Envelope, Request, Response, SubscriptionEvent, read_frame,
     read_subscription_event, write_frame,
 };
-use opencode_pty::service::{CreateTerminal, TerminalInfo};
+use opencode_pty::service::{CreateTerminal, TerminalInfo, TerminalLifecycle};
 use terminal_fixture::{Command as FixtureCommand, Deadline, Fixture, TempDir};
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
 };
 
 struct Daemon {
@@ -108,21 +109,51 @@ impl Daemon {
     }
 
     fn subscribe(&self, id: u64, role: AttachmentRole) -> PipeConnection {
-        let mut stream = self.connect();
-        assert!(matches!(
-            self.send(
-                &mut stream,
-                Request::Subscribe {
-                    id,
-                    offset: 0,
-                    attachment_id: "daemon-test".into(),
-                    role,
-                    takeover: false,
-                }
-            ),
-            Response::Attached { .. }
-        ));
+        let (stream, response) = self.attach(id, "daemon-test", role);
+        assert!(matches!(response, Response::Attached { .. }));
         stream
+    }
+
+    fn attach(
+        &self,
+        id: u64,
+        attachment_id: &str,
+        role: AttachmentRole,
+    ) -> (PipeConnection, Response) {
+        let mut stream = self.connect();
+        let response = self.send(
+            &mut stream,
+            Request::Subscribe {
+                id,
+                offset: 0,
+                attachment_id: attachment_id.into(),
+                role,
+                takeover: false,
+            },
+        );
+        (stream, response)
+    }
+
+    fn snapshot(&self, id: u64) -> (TerminalInfo, String) {
+        match self.request(Request::Snapshot { id }) {
+            Response::Snapshot { terminal, text, .. } => (terminal, text),
+            response => panic!("snapshot: {response:?}"),
+        }
+    }
+
+    fn wait_text(&self, id: u64, expected: &str) -> (TerminalInfo, String) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = self.snapshot(id);
+            if snapshot.1.contains(expected) {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing {expected:?}: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait(&mut self) {
@@ -382,4 +413,297 @@ fn owner_loss_cancels_blocked_subscriber_and_partial_request() {
         unsafe { WaitForSingleObject(process.as_raw_handle(), 3000) },
         WAIT_OBJECT_0
     );
+}
+
+#[test]
+fn natural_exit_delivers_contiguous_output_and_retains_final_state() {
+    let _deadline = Deadline::new();
+    let mut daemon = Daemon::start();
+    let (owner, response) = daemon.own(None);
+    assert!(matches!(response, Response::Owned));
+    let fixture = Fixture::new();
+    let terminal = daemon.create(&fixture);
+    let mut child = fixture.connect();
+    // Capture a stable process handle before exit; the PID is not terminal identity.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            terminal.pid.unwrap(),
+        )
+    };
+    assert!(!process.is_null());
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+
+    child.command(FixtureCommand::Output(
+        "\x1b[2J\x1b[HBEFORE_ATTACH_MARKER\r\n".into(),
+    ));
+    daemon.wait_text(terminal.id, "BEFORE_ATTACH_MARKER");
+    let (mut subscription, response) =
+        daemon.attach(terminal.id, "exit-observer", AttachmentRole::Observer);
+    let Response::Attached {
+        requested_offset,
+        available_offset,
+        end_offset,
+        truncated,
+        replay_base64,
+        ..
+    } = response
+    else {
+        panic!("attach: {response:?}");
+    };
+    assert_eq!(requested_offset, 0);
+    assert_eq!(available_offset, 0);
+    assert!(!truncated);
+    let mut bytes = base64::engine::general_purpose::STANDARD
+        .decode(replay_base64)
+        .unwrap();
+    assert_eq!(end_offset, bytes.len() as u64);
+    assert!(String::from_utf8_lossy(&bytes).contains("BEFORE_ATTACH_MARKER"));
+    let mut offset = end_offset;
+
+    child.command(FixtureCommand::Output("\r\nFINAL_DAEMON_MARKER\r\n".into()));
+    child.command(FixtureCommand::Exit(23));
+    let exit_code = loop {
+        match read_subscription_event(&mut subscription).unwrap() {
+            SubscriptionEvent::Output {
+                start,
+                end,
+                bytes: output,
+            } => {
+                assert_eq!(
+                    start, offset,
+                    "output must be contiguous after attachment replay"
+                );
+                assert_eq!(end - start, output.len() as u64);
+                bytes.extend(output);
+                offset = end;
+            }
+            SubscriptionEvent::Response(response) => match *response {
+                Response::Exited {
+                    exit_code,
+                    final_offset,
+                } => {
+                    assert_eq!(final_offset, offset);
+                    break exit_code;
+                }
+                Response::Error { message } => panic!("subscription: {message}"),
+                _ => {}
+            },
+        }
+    };
+    drop(subscription);
+    assert!(String::from_utf8_lossy(&bytes).contains("FINAL_DAEMON_MARKER"));
+    // SAFETY: the live owned process handle permits waiting and exit-code queries.
+    assert_eq!(
+        unsafe { WaitForSingleObject(process.as_raw_handle(), 3000) },
+        WAIT_OBJECT_0
+    );
+    let mut actual_exit = 0;
+    assert_ne!(
+        unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut actual_exit) },
+        0
+    );
+    assert_eq!(actual_exit, 23);
+    assert_eq!(exit_code, Some(actual_exit));
+
+    let (info, text) = daemon.snapshot(terminal.id);
+    assert_eq!(info.lifecycle, TerminalLifecycle::Exited { exit_code });
+    assert_eq!(info.output_tail, offset);
+    assert!(text.contains("FINAL_DAEMON_MARKER"), "{text:?}");
+    let Response::Rows {
+        terminal: rows_info,
+        lines,
+        ..
+    } = daemon.request(Request::ReadRows {
+        id: terminal.id,
+        rows: None,
+    })
+    else {
+        panic!("rows response");
+    };
+    assert_eq!(rows_info.lifecycle, info.lifecycle);
+    assert_eq!(rows_info.output_tail, offset);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("FINAL_DAEMON_MARKER"))
+    );
+    let Response::Replay {
+        requested_offset,
+        available_offset,
+        end_offset,
+        truncated,
+        data_base64,
+    } = daemon.request(Request::Replay {
+        id: terminal.id,
+        offset: 0,
+    })
+    else {
+        panic!("replay response");
+    };
+    assert_eq!(requested_offset, 0);
+    assert_eq!(available_offset, 0);
+    assert_eq!(end_offset, offset);
+    assert!(!truncated);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .unwrap(),
+        bytes
+    );
+    assert!(
+        matches!(daemon.own(None).1, Response::Error { .. }),
+        "terminal exit must not lose the live owner"
+    );
+    assert!(matches!(
+        daemon.request(Request::Terminate { id: terminal.id }),
+        Response::Ok
+    ));
+    assert!(
+        matches!(daemon.request(Request::List), Response::Terminals { terminals } if terminals.is_empty())
+    );
+    assert!(matches!(daemon.request(Request::Shutdown), Response::Ok));
+    drop(owner);
+    daemon.wait();
+}
+
+#[test]
+fn observer_disconnect_and_control_input_preserve_independent_terminals() {
+    let _deadline = Deadline::new();
+    let mut daemon = Daemon::start();
+    let (owner, response) = daemon.own(None);
+    assert!(matches!(response, Response::Owned));
+    let first_fixture = Fixture::new();
+    let second_fixture = Fixture::new();
+    let first = daemon.create(&first_fixture);
+    let second = daemon.create(&second_fixture);
+    assert_ne!(first.id, second.id);
+    let mut first_child = first_fixture.connect();
+    let mut second_child = second_fixture.connect();
+    let (first_control, response) =
+        daemon.attach(first.id, "first-controller", AttachmentRole::Controller);
+    assert!(matches!(response, Response::Attached { .. }));
+    let (second_control, response) =
+        daemon.attach(second.id, "second-controller", AttachmentRole::Observer);
+    assert!(matches!(response, Response::Attached { .. }));
+    let (observer, response) =
+        daemon.attach(first.id, "disposable-observer", AttachmentRole::Observer);
+    assert!(matches!(response, Response::Attached { .. }));
+    drop(observer);
+
+    let first_input = b"first-directed";
+    assert!(matches!(
+        daemon.request(Request::Input {
+            id: first.id,
+            attachment_id: "first-controller".into(),
+            cols: 91,
+            rows: 27,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(first_input),
+        }),
+        Response::Ok
+    ));
+    assert_eq!(
+        first_child.command(FixtureCommand::Read(first_input.len())),
+        serde_json::json!(first_input)
+    );
+    assert_eq!(
+        first_child.command(FixtureCommand::Size),
+        serde_json::json!([91, 27])
+    );
+
+    assert!(matches!(
+        daemon.request(Request::Control {
+            id: second.id,
+            attachment_id: "second-controller".into(),
+            cols: 73,
+            rows: 29,
+        }),
+        Response::Ok
+    ));
+    assert_eq!(
+        second_child.command(FixtureCommand::Size),
+        serde_json::json!([73, 29])
+    );
+    let second_input = b"second-directed";
+    assert!(matches!(
+        daemon.request(Request::Input {
+            id: second.id,
+            attachment_id: "second-controller".into(),
+            cols: 74,
+            rows: 30,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(second_input),
+        }),
+        Response::Ok
+    ));
+    assert_eq!(
+        second_child.command(FixtureCommand::Read(second_input.len())),
+        serde_json::json!(second_input)
+    );
+    assert_eq!(
+        second_child.command(FixtureCommand::Size),
+        serde_json::json!([74, 30])
+    );
+    assert_eq!(
+        first_child.command(FixtureCommand::Size),
+        serde_json::json!([91, 27])
+    );
+    first_child.command(FixtureCommand::Output(
+        "\x1b[2J\x1b[HFIRST_ONLY_MARKER".into(),
+    ));
+    second_child.command(FixtureCommand::Output(
+        "\x1b[2J\x1b[HSECOND_ONLY_MARKER".into(),
+    ));
+    let (first_info, first_text) = daemon.wait_text(first.id, "FIRST_ONLY_MARKER");
+    let (second_info, second_text) = daemon.wait_text(second.id, "SECOND_ONLY_MARKER");
+    assert_eq!(first_info.lifecycle, TerminalLifecycle::Running);
+    assert_eq!(second_info.lifecycle, TerminalLifecycle::Running);
+    assert!(!first_text.contains("SECOND_ONLY_MARKER"));
+    assert!(!second_text.contains("FIRST_ONLY_MARKER"));
+    assert!(
+        matches!(daemon.request(Request::List), Response::Terminals { terminals } if terminals.len() == 2)
+    );
+    assert!(
+        matches!(daemon.request(Request::Ping), Response::Pong { instance_id, pid, protocol: 7 }
+        if instance_id == daemon.registration.instance_id && pid == daemon.registration.pid)
+    );
+    assert!(matches!(daemon.own(None).1, Response::Error { .. }));
+
+    assert!(matches!(
+        daemon.request(Request::Terminate { id: first.id }),
+        Response::Ok
+    ));
+    drop(first_control);
+    assert!(
+        matches!(daemon.request(Request::List), Response::Terminals { terminals }
+        if terminals.len() == 1 && terminals[0].id == second.id)
+    );
+    let input = b"after-first-exit";
+    assert!(matches!(
+        daemon.request(Request::Input {
+            id: second.id,
+            attachment_id: "second-controller".into(),
+            cols: 74,
+            rows: 30,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(input),
+        }),
+        Response::Ok
+    ));
+    assert_eq!(
+        second_child.command(FixtureCommand::Read(input.len())),
+        serde_json::json!(input)
+    );
+    second_child.command(FixtureCommand::Output("\r\nSECOND_SURVIVES\r\n".into()));
+    assert_eq!(
+        daemon.wait_text(second.id, "SECOND_SURVIVES").0.lifecycle,
+        TerminalLifecycle::Running
+    );
+    drop(second_control);
+    assert!(matches!(
+        daemon.request(Request::Terminate { id: second.id }),
+        Response::Ok
+    ));
+    assert!(matches!(daemon.request(Request::Shutdown), Response::Ok));
+    drop(owner);
+    daemon.wait();
 }
