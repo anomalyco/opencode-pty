@@ -10,18 +10,19 @@ cannot block the service or another terminal.
 Every daemon has one owner connection. The playground starts a daemon and holds
 that connection until exit; exiting the playground stops the daemon and all its
 terminals. Observer commands connect to an existing daemon without taking ownership.
-The service uses a private authenticated Unix socket and atomic registration file.
+The service uses a private authenticated local byte stream (Unix socket or Windows
+named pipe) and an atomic registration file.
 
 Integrations launch `opencode-pty daemon` (protocol 7).
 The server must claim the daemon within 5 seconds by sending the authenticated
 framed envelope `{"token":"...","request":{"op":"own","instance_id":"..."}}`.
 The response is `{"type":"owned"}`; that connection stays open as the sole
-owner. Ordinary requests and subscriptions use their existing separate sockets.
+owner. Ordinary requests and subscriptions use separate connections.
 The instance ID and token come from the private registration file.
 
 Losing the owner connection stops the daemon and its terminals unless the owner
 first sends `{"token":"...","request":{"op":"prepare_handoff"}}` on that same
-socket. The response is `{"type":"handoff","ticket":"...","expires_at":123}`,
+connection. The response is `{"type":"handoff","ticket":"...","expires_at":123}`,
 where `expires_at` is Unix milliseconds, 120 seconds from preparation. Repeated
 preparation during that window returns the same ticket and deadline. After the
 old owner disconnects, a successor claims the same instance with the ticket in
@@ -60,8 +61,22 @@ response or the final subscription event. Completion retains queued bytes while
 waiting for that close, with a two-second grace period and daemon cancellation;
 it never calls the potentially unbounded `FlushFileBuffers`. Stopping acceptance
 retains a pipe instance until registration is removed, preventing namespace
-squatting during cleanup. The backend has native Windows tests, but the Windows
-daemon entrypoint/registration lifecycle is not enabled yet.
+squatting during cleanup.
+
+On Windows, `opencode-pty daemon` stores `service.json` and `service.lock` in
+`%LOCALAPPDATA%\opencode-pty`, or an absolute `OPENCODE_PTY_RUNTIME_DIR` override.
+Missing `LOCALAPPDATA` without an override is an error. Storage entries must not
+be reparse points or owned by another user; the directory, lock, and registration
+use protected current-user-only ACLs. The held directory/lock handles deny delete
+sharing, and registration is atomically replaced under the exclusive lock.
+Stale registration is replaced with a fresh instance ID, token, and pipe name;
+cleanup removes registration only if its instance ID still matches.
+
+The Windows Rust `TerminalClient` and interactive CLI are not ported. Integrations
+can use protocol 7 directly and the minimal `daemon::PipeConnection` byte-stream
+helper (connect plus optional read/write timeouts). On Windows, `service_dir()`
+and `registration_path()` are fallible because runtime storage must be resolved
+without an insecure fallback.
 
 ## Architecture
 
@@ -263,11 +278,15 @@ observes actual console stdin without echo; `Size` and `Context` inspect the
 child's OS console and process context. The ignored `child` test is only its
 subprocess entry point, not skipped runtime coverage.
 
-The older service, ownership, playground, and rows integration suites remain
-Unix-only. Windows library tests also exercise real named-pipe roundtrips,
-multiple connections, namespace ownership, cancellation, and final-frame
-completion. These checks do not yet establish Windows daemon support or
-complete ConPTY shutdown behavior.
+The original service, ownership, playground, and rows integration suites remain
+Unix-only. Windows library tests exercise real named-pipe roundtrips, multiple
+connections, namespace ownership, cancellation, final-frame completion, and
+private atomic registration. `tests/windows-daemon.rs` exercises authenticated
+ownership/handoff, locking/stale registration, partial requests, blocked
+subscribers, and live ConPTY create/input/output/resize/shutdown through the real
+daemon. Natural child-exit/ConPTY EOF and runtime cleanup are checked by the
+direct runtime suite; the basic daemon tests do not establish complete lifecycle
+coverage on their own.
 
 On Windows, normal root-child exit hands the ConPTY master to the existing
 child-wait worker for closing. The actor and reader continue draining until the
@@ -322,8 +341,8 @@ uses named pipes. Platform signing will be added later.
 
 ## Current Limits
 
-- The Windows named-pipe backend is tested independently; persistent daemon
-  startup and private registration storage are still Unix-only.
+- Windows supports the daemon/protocol transport, not the Rust interactive
+  TerminalClient/play/watch CLI.
 - Ordinary API operations use one framed JSON request per connection;
   subscriptions keep the authenticated connection open for ordered live events.
 - The OpenCode backend proxy and ordered group APIs are implemented, but the

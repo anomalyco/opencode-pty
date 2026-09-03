@@ -20,41 +20,49 @@ pub fn run() -> Result<()> {
     let service = Arc::new(TerminalService::default());
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handlers = Vec::<(Cancellation, thread::JoinHandle<()>)>::new();
-    while !shutdown.load(Ordering::Acquire) {
-        if ownership
-            .lock()
-            .map_err(|_| anyhow!("ownership lock poisoned"))?
-            .tick(Instant::now())
-        {
-            shutdown.store(true, Ordering::Release);
-            break;
-        }
-        for (_, handler) in handlers.extract_if(.., |(_, handler)| handler.is_finished()) {
-            let _ = handler.join();
-        }
-        match listener.accept() {
-            Ok(Some(stream)) => {
-                let control = stream.cancellation()?;
-                let service = Arc::clone(&service);
-                let shutdown = Arc::clone(&shutdown);
-                let ownership = Arc::clone(&ownership);
-                let registration = registration.clone();
-                let handle = thread::spawn(move || {
-                    if let Err(error) =
-                        handle_connection(stream, &service, &registration, &shutdown, &ownership)
-                    {
-                        eprintln!("opencode-pty request failed: {error:#}");
-                    }
-                });
-                handlers.push((control, handle));
+    let result = (|| -> Result<()> {
+        while !shutdown.load(Ordering::Acquire) {
+            if ownership
+                .lock()
+                .map_err(|_| anyhow!("ownership lock poisoned"))?
+                .tick(Instant::now())
+            {
+                shutdown.store(true, Ordering::Release);
+                break;
             }
-            Ok(None) => {
-                thread::sleep(Duration::from_millis(10));
+            for (_, handler) in handlers.extract_if(.., |(_, handler)| handler.is_finished()) {
+                let _ = handler.join();
             }
-            Err(error) => return Err(error.into()),
+            match listener.accept() {
+                Ok(Some(stream)) => {
+                    let control = stream.cancellation()?;
+                    let service = Arc::clone(&service);
+                    let shutdown = Arc::clone(&shutdown);
+                    let ownership = Arc::clone(&ownership);
+                    let registration = registration.clone();
+                    let handle = thread::spawn(move || {
+                        if let Err(error) = handle_connection(
+                            stream,
+                            &service,
+                            &registration,
+                            &shutdown,
+                            &ownership,
+                        ) {
+                            eprintln!("opencode-pty request failed: {error:#}");
+                        }
+                    });
+                    handlers.push((control, handle));
+                }
+                Ok(None) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-    }
+        Ok(())
+    })();
 
+    shutdown.store(true, Ordering::Release);
     listener.stop();
     // Unblock partial requests, owner reads, and backpressured subscriptions
     // before joining. PTY workers still use their existing termination path.
@@ -75,12 +83,12 @@ pub fn run() -> Result<()> {
         let _ = handler.join();
     }
     drop(service);
-    platform::cleanup(registration)?;
+    let cleanup = platform::cleanup(registration);
     drop(listener);
     let _ = cleanup_tx.send(());
     let _ = watchdog.join();
     drop(runtime);
-    Ok(())
+    result.and(cleanup)
 }
 
 fn handle_connection(

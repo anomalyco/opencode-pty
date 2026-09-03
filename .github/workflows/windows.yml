@@ -126,6 +126,10 @@ jobs:
         if: failure() && steps.tests.outcome == 'failure'
         timeout-minutes: 3
         run: cargo test --locked --test runtime -- --test-threads=1 --nocapture
+      - name: Diagnose failed daemon tests
+        if: failure() && steps.tests.outcome == 'failure'
+        timeout-minutes: 3
+        run: cargo test --locked --test windows-daemon -- --test-threads=1 --nocapture
       - name: Smoke test executable
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -145,9 +149,10 @@ jobs:
 
           Target: $env:CARGO_BUILD_TARGET
 
-          This job builds the executable and runs all enabled tests natively, including libghostty parser, protocol, and direct TerminalService ConPTY runtime tests.
+          This job builds the executable and runs all enabled tests natively, including libghostty parser, protocol, direct TerminalService ConPTY runtime, named-pipe transport, and daemon tests.
           The runtime suite spawns real Rust console children and checks input/output, Unicode, cwd/environment/argv/PATH, OS resize, snapshots, replay, terminal replies, and independent terminals.
+          Daemon tests cover private atomic registration, ownership/handoff, stale registration/locking, partial requests, blocked subscribers, and live ConPTY operations over real named pipes.
           The older service, ownership, playground, and rows integration suites remain Unix-only.
-          A passing run does not imply Windows named-pipe transport or complete ConPTY shutdown coverage is implemented.
+          Basic tests do not establish exhaustive lifecycle coverage or Windows interactive CLI parity.
           No packages or releases are published.
           "@ >> $env:GITHUB_STEP_SUMMARY

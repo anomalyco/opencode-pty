@@ -70,6 +70,8 @@ impl Listener {
         let previous = std::mem::replace(&mut self.pending, next);
         Ok(Some(Connection {
             pipe: Arc::clone(&previous.operation.pipe),
+            read_timeout: None,
+            write_timeout: None,
         }))
     }
 
@@ -159,8 +161,10 @@ impl Pipe {
     }
 }
 
-pub(crate) struct Connection {
+pub struct Connection {
     pipe: Arc<Pipe>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 }
 
 impl Connection {
@@ -186,6 +190,8 @@ impl Connection {
                 Ok(handle) => {
                     return Ok(Self {
                         pipe: Arc::new(Pipe::new(handle)?),
+                        read_timeout: None,
+                        write_timeout: None,
                     });
                 }
                 Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
@@ -205,14 +211,22 @@ impl Connection {
         }
     }
 
-    pub fn cancellation(&self) -> io::Result<Cancellation> {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout;
+    }
+
+    pub(crate) fn cancellation(&self) -> io::Result<Cancellation> {
         Ok(Cancellation(Arc::clone(&self.pipe)))
     }
 
     /// Protocol 7 has an explicit response/final event, not a pipe half-close.
     /// Retain the pipe until the client reads that frame and closes its end.
     /// An uncooperative peer is cancelled after a bounded grace period.
-    pub fn finish_response(&mut self) -> io::Result<()> {
+    pub(crate) fn finish_response(&mut self) -> io::Result<()> {
         match self.read_with_timeout(&mut [0], Some(COMPLETION_TIMEOUT)) {
             Ok(0) => Ok(()),
             Ok(_) => Err(io::Error::new(
@@ -226,9 +240,11 @@ impl Connection {
         }
     }
 
-    pub fn monitor_disconnect(&self) -> io::Result<DisconnectMonitor> {
+    pub(crate) fn monitor_disconnect(&self) -> io::Result<DisconnectMonitor> {
         let mut reader = Self {
             pipe: Arc::clone(&self.pipe),
+            read_timeout: None,
+            write_timeout: None,
         };
         let cancellation = self.cancellation()?;
         let (sender, disconnected) = bounded(1);
@@ -282,7 +298,7 @@ impl Connection {
 
 impl Read for Connection {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.read_with_timeout(bytes, None)
+        self.read_with_timeout(bytes, self.read_timeout)
     }
 }
 
@@ -307,7 +323,7 @@ impl Write for Connection {
         })?;
         Ok(match ready {
             Some(count) => count,
-            None => operation.wait(None)?,
+            None => operation.wait(self.write_timeout)?,
         } as usize)
     }
 
