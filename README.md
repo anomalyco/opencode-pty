@@ -40,15 +40,28 @@ backend preserves half-close when completing subscriptions so queued final
 frames are not discarded on macOS. Shutdown cancellation is a separate operation
 that wakes partial requests and blocked subscription writes before joining.
 
-The planned Windows backend keeps protocol 7 and the registration fields
+The Windows named-pipe backend keeps protocol 7 and the registration fields
 `instance_id`, `pid`, `protocol`, `socket`, and `token`. Treat `socket` as an opaque
-local endpoint: on Windows it will be `\\.\pipe\opencode-pty-<instance_id>`, not a
+local endpoint: on Windows it is `\\.\pipe\opencode-pty-<instance_id>`, not a
 filesystem socket. A random per-instance name, exclusive first pipe instance,
 current-user access control, and rejection of remote clients protect the endpoint;
 the private registration file remains the discovery and authentication source.
-Named-pipe completion will use explicit bounded, cancellable delivery rather than
-pretending to support Unix half-close. This boundary alone does not implement
-Windows transport or daemon support.
+The pipe is full-duplex and byte-mode, with overlapped reads/writes capped at
+64 KiB per kernel operation. Accept polling never waits for a client; connect
+retries are bounded to five seconds. Each pending operation is cancelled and its
+completion reaped before its buffers or event are freed.
+The kernel-retained `OVERLAPPED` allocation uses an owned raw pointer, not a
+retained borrow from a movable `Box`; it is reclaimed only after I/O completion.
+The allocation helper's move/repeated-access behavior is checked under both
+Miri borrow models alongside the callback ownership tests.
+
+Named pipes have no half-close. Protocol clients close after reading an ordinary
+response or the final subscription event. Completion retains queued bytes while
+waiting for that close, with a two-second grace period and daemon cancellation;
+it never calls the potentially unbounded `FlushFileBuffers`. Stopping acceptance
+retains a pipe instance until registration is removed, preventing namespace
+squatting during cleanup. The backend has native Windows tests, but the Windows
+daemon entrypoint/registration lifecycle is not enabled yet.
 
 ## Architecture
 
@@ -235,8 +248,9 @@ the build tree and runs it without Cargo's DLL search paths, verifying that
 libghostty is statically linked. It does not publish packages or releases.
 
 The current service, ownership, playground, and rows integration suites are
-Unix-only. A green Windows job verifies compilation and the enabled parser and
-protocol tests, not working Windows transport or ConPTY lifecycle support.
+Unix-only. Windows library tests also exercise real named-pipe roundtrips,
+multiple connections, namespace ownership, cancellation, and final-frame
+completion. They do not yet verify Windows daemon or ConPTY lifecycle support.
 
 Once the workflow is on `master`, it can also be run manually against a branch:
 
@@ -274,8 +288,8 @@ uses named pipes. Platform signing will be added later.
 
 ## Current Limits
 
-- Persistent transport currently uses Unix sockets; Windows named pipes are not
-  implemented yet.
+- The Windows named-pipe backend is tested independently; persistent daemon
+  startup and private registration storage are still Unix-only.
 - Ordinary API operations use one framed JSON request per connection;
   subscriptions keep the authenticated connection open for ordered live events.
 - The OpenCode backend proxy and ordered group APIs are implemented, but the
