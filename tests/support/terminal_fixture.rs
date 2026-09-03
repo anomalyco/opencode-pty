@@ -76,6 +76,8 @@ impl Fixture {
                 Err(error) => panic!("PTY child connection: {error}"),
             }
         };
+        // BSD sockets inherit the listener's nonblocking mode on accept.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(TIMEOUT)).unwrap();
         let mut connection = Connection(BufReader::new(stream));

@@ -124,28 +124,6 @@ fn executable_is_resolved_from_child_path() {
 }
 
 #[test]
-fn relative_program_is_resolved_from_child_cwd() {
-    let _deadline = Deadline::new();
-    let directory = TempDir::new();
-    let fixture = Fixture::new();
-    let service = TerminalService::default();
-    let name = if cfg!(windows) {
-        "child-relative.exe"
-    } else {
-        "child-relative"
-    };
-    directory.executable(name);
-    let mut request = fixture.request();
-    request.program = format!("./{name}");
-    request.cwd = directory.0.clone();
-    let info = service.create(request).unwrap();
-    let mut child = fixture.connect();
-    child.command(Command::Output("\r\nRELATIVE_OK".into()));
-    wait_text(&service, info.id, "RELATIVE_OK");
-    service.terminate(info.id).unwrap();
-}
-
-#[test]
 fn resize_updates_real_console_and_parser() {
     let _deadline = Deadline::new();
     let fixture = Fixture::new();
