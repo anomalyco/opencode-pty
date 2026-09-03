@@ -267,7 +267,7 @@ fn foreground_process_tracks_deepest_tty_attached_job() {
             "controller".to_string(),
             80,
             24,
-            b"tail -f /dev/null & sleep 5\n".to_vec(),
+            b"tail --pid=$$ -f /dev/null & sleep 5\n".to_vec(),
         )
         .expect("sleep submitted");
 

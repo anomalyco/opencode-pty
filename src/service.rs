@@ -119,10 +119,15 @@ pub struct TerminalAttachment {
     pub events: Receiver<StreamEvent>,
     actor_tx: Sender<ActorMessage>,
     attachment_id: String,
+    disconnect_tx: Option<Sender<()>>,
 }
 
 impl Drop for TerminalAttachment {
     fn drop(&mut self) {
+        // Guard lifetime, not the lifetime of public event-receiver clones,
+        // controls subscription cancellation. Wake a blocked controller send
+        // before reliably queuing Detach on the possibly full actor channel.
+        drop(self.disconnect_tx.take());
         let _ = self.actor_tx.send(ActorMessage::Detach {
             attachment_id: self.attachment_id.clone(),
         });
@@ -350,6 +355,7 @@ impl TerminalService {
             events: attached.events,
             actor_tx: terminal.actor_tx.clone(),
             attachment_id,
+            disconnect_tx: Some(attached.disconnect_tx),
         })
     }
 
@@ -687,12 +693,23 @@ struct Attached {
     generation: u64,
     replay: RawReplay,
     events: Receiver<StreamEvent>,
+    disconnect_tx: Sender<()>,
 }
 
 struct Subscriber {
     events: Sender<StreamEvent>,
+    disconnected: Receiver<()>,
     role: AttachmentRole,
     last_control: u64,
+}
+
+impl Subscriber {
+    fn is_disconnected(&self) -> bool {
+        matches!(
+            self.disconnected.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        )
+    }
 }
 
 enum WriterMessage {
@@ -773,7 +790,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     let mut controller_generation = 0_u64;
     let mut child_exit = None::<std::result::Result<Option<u32>, String>>;
     let mut reader_eof = false;
-    let mut exit_published = false;
+    let mut final_exit = None::<StreamEvent>;
     let mut pending_message = None;
     let _ = init_tx.send(Ok(()));
 
@@ -1003,10 +1020,12 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     }
                     let replay = replay.read_from(offset)?;
                     let (events_tx, events) = bounded(SUBSCRIBER_QUEUE_CAPACITY);
+                    let (disconnect_tx, disconnected) = bounded(0);
                     subscribers.insert(
                         attachment_id.clone(),
                         Subscriber {
-                            events: events_tx,
+                            events: events_tx.clone(),
+                            disconnected,
                             role,
                             last_control: if role == AttachmentRole::Controller {
                                 controller_generation
@@ -1029,16 +1048,31 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                             },
                         );
                     }
+                    if let Some(event) = &final_exit {
+                        // This fresh receiver is still actor-owned and has at
+                        // most its initial ControllerChanged event queued.
+                        let _ = events_tx.send(event.clone());
+                    }
                     Ok(Attached {
                         generation: controller_generation,
                         replay,
                         events,
+                        disconnect_tx,
                     })
                 })();
                 let _ = reply.send(result);
             }
             Ok(ActorMessage::Detach { attachment_id }) => {
-                let removed = subscribers.remove(&attachment_id);
+                // A stale guard may share a string ID with a newer attachment.
+                // Its queued message must not remove the newer, still-live guard.
+                let removed = if subscribers
+                    .get(&attachment_id)
+                    .is_some_and(Subscriber::is_disconnected)
+                {
+                    subscribers.remove(&attachment_id)
+                } else {
+                    None
+                };
                 if removed.is_some() && controller.as_ref() == Some(&attachment_id) {
                     controller_generation = controller_generation.saturating_add(1);
                     controller = promote_latest(&mut subscribers, controller_generation);
@@ -1069,7 +1103,9 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Ok(ActorMessage::ReaderFailed(message)) | Ok(ActorMessage::WriterFailed(message)) => {
                 // Closing ConPTY can finish a pending write with BrokenPipe
                 // after the final exit event. Never overwrite a published exit.
-                if !exit_published && let Ok(mut value) = info.write() {
+                if final_exit.is_none()
+                    && let Ok(mut value) = info.write()
+                {
                     value.lifecycle = TerminalLifecycle::Failed { message };
                 }
             }
@@ -1080,7 +1116,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
         }
         if reader_eof
-            && !exit_published
+            && final_exit.is_none()
             && let Some(result) = child_exit.take()
         {
             let exit_code = result.as_ref().ok().copied().flatten();
@@ -1090,17 +1126,18 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     Err(message) => TerminalLifecycle::Failed { message },
                 };
             }
+            let event = StreamEvent::Exited {
+                exit_code,
+                final_offset: replay.tail,
+            };
             broadcast(
                 &shutdown,
                 &mut subscribers,
                 &mut controller,
                 &mut controller_generation,
-                StreamEvent::Exited {
-                    exit_code,
-                    final_offset: replay.tail,
-                },
+                event.clone(),
             );
-            exit_published = true;
+            final_exit = Some(event);
         }
     };
     // Release senders blocked on the actor queue before closing ConPTY. Its
@@ -1452,11 +1489,16 @@ fn broadcast(
 ) {
     let mut dropped = Vec::new();
     for (id, subscriber) in subscribers.iter() {
+        if subscriber.is_disconnected() {
+            dropped.push(id.clone());
+            continue;
+        }
         let failed = match subscriber.role {
             AttachmentRole::Controller => crossbeam_channel::select_biased! {
                 // Quitting is not a subscriber disconnect: do not promote and
                 // recursively notify controllers while tearing the actor down.
                 recv(shutdown) -> _ => return,
+                recv(subscriber.disconnected) -> _ => true,
                 send(subscriber.events, event.clone()) -> result => result.is_err(),
             },
             AttachmentRole::Observer => subscriber.events.try_send(event.clone()).is_err(),
@@ -1471,24 +1513,28 @@ fn broadcast(
     ) {
         return;
     }
+    let mut controller_dropped = false;
     for id in dropped {
         subscribers.remove(&id);
-        if controller.as_ref() == Some(&id) {
-            *controller_generation = controller_generation.saturating_add(1);
-            *controller = promote_latest(subscribers, *controller_generation);
-            let generation = *controller_generation;
-            let attachment_id = controller.clone();
-            broadcast(
-                shutdown,
-                subscribers,
-                controller,
-                controller_generation,
-                StreamEvent::ControllerChanged {
-                    attachment_id,
-                    generation,
-                },
-            );
-        }
+        controller_dropped |= controller.as_ref() == Some(&id);
+    }
+    // Remove the whole failed set before selecting a replacement. In
+    // particular, an already-full observer must not become a blocking sender.
+    if controller_dropped {
+        *controller_generation = controller_generation.saturating_add(1);
+        *controller = promote_latest(subscribers, *controller_generation);
+        let generation = *controller_generation;
+        let attachment_id = controller.clone();
+        broadcast(
+            shutdown,
+            subscribers,
+            controller,
+            controller_generation,
+            StreamEvent::ControllerChanged {
+                attachment_id,
+                generation,
+            },
+        );
     }
 }
 
@@ -1496,6 +1542,7 @@ fn promote_latest(
     subscribers: &mut HashMap<String, Subscriber>,
     generation: u64,
 ) -> Option<String> {
+    subscribers.retain(|_, subscriber| !subscriber.is_disconnected());
     let attachment_id = subscribers
         .iter()
         .max_by_key(|(_, subscriber)| subscriber.last_control)
@@ -1582,6 +1629,23 @@ mod tests {
         }
     }
 
+    fn test_info() -> TerminalInfo {
+        TerminalInfo {
+            id: 1,
+            pid: None,
+            title: "test".into(),
+            foreground_process: None,
+            group_id: "test".into(),
+            command: vec![],
+            cwd: PathBuf::new(),
+            cols: 80,
+            rows: 24,
+            lifecycle: TerminalLifecycle::Running,
+            output_head: 0,
+            output_tail: 0,
+        }
+    }
+
     // Real actor/parser and bounded channels, without OS pipe capacity or a
     // large output flood. Native child/handle coverage lives in tests/runtime.rs.
     fn test_actor() -> (TerminalHandle, Receiver<WriterMessage>) {
@@ -1597,20 +1661,7 @@ mod tests {
             }
         });
         let (init_tx, init_rx) = std_mpsc::sync_channel(1);
-        let info = Arc::new(RwLock::new(TerminalInfo {
-            id: 1,
-            pid: None,
-            title: "test".into(),
-            foreground_process: None,
-            group_id: "test".into(),
-            command: vec![],
-            cwd: PathBuf::new(),
-            cols: 80,
-            rows: 24,
-            lifecycle: TerminalLifecycle::Running,
-            output_head: 0,
-            output_tail: 0,
-        }));
+        let info = Arc::new(RwLock::new(test_info()));
         let actor_info = Arc::clone(&info);
         let actor = thread::spawn(move || {
             run_actor(ActorConfig {
@@ -1703,6 +1754,60 @@ mod tests {
     }
 
     #[test]
+    fn late_attachments_receive_final_exit_after_replay_and_control() {
+        let (actor, _writer) = test_actor();
+        for message in [
+            ActorMessage::Output(b"final".to_vec()),
+            ActorMessage::ChildExited(Ok(Some(23))),
+            ActorMessage::ReaderEof,
+        ] {
+            actor.actor_tx.send(message).unwrap();
+        }
+        let mut received = Vec::new();
+        for role in [AttachmentRole::Observer, AttachmentRole::Controller] {
+            let attached = actor
+                .request(|reply| ActorMessage::Attach {
+                    offset: 2,
+                    attachment_id: "late".into(),
+                    role,
+                    takeover: false,
+                    reply,
+                })
+                .unwrap();
+            received.push((
+                role,
+                attached.replay.clone(),
+                attached.events.try_iter().collect::<Vec<_>>(),
+            ));
+            drop(attached);
+            actor
+                .actor_tx
+                .send(ActorMessage::Detach {
+                    attachment_id: "late".into(),
+                })
+                .unwrap();
+        }
+        actor.shutdown().unwrap();
+        for (role, replay, mut events) in received {
+            assert_eq!(replay.bytes, b"nal");
+            assert_eq!((replay.available_offset, replay.end_offset), (2, 5));
+            if role == AttachmentRole::Controller {
+                assert!(matches!(
+                    events.remove(0),
+                    StreamEvent::ControllerChanged { .. }
+                ));
+            }
+            assert!(matches!(
+                events.as_slice(),
+                [StreamEvent::Exited {
+                    exit_code: Some(23),
+                    final_offset: 5
+                }]
+            ));
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn failed_close_handoff_retains_master_ownership() {
         let (close_tx, close_rx) = bounded(1);
@@ -1713,6 +1818,168 @@ mod tests {
         };
         assert!(master.close().is_err());
         assert!(master.get().is_ok());
+    }
+
+    #[test]
+    fn attachment_drop_unblocks_controller_send_with_a_receiver_clone() {
+        let (actor_tx, messages) = bounded(1);
+        actor_tx.send(ActorMessage::ReaderEof).unwrap();
+        let (events_tx, events) = bounded(1);
+        events_tx
+            .send(StreamEvent::TitleChanged {
+                title: "queued".into(),
+            })
+            .unwrap();
+        let retained_events = events.clone();
+        let (disconnect_tx, disconnected) = bounded(0);
+        let attachment = TerminalAttachment {
+            terminal: test_info(),
+            role: AttachmentRole::Controller,
+            generation: 1,
+            replay: ReplayBuffer::new(0).read_from(0).unwrap(),
+            events,
+            actor_tx,
+            attachment_id: "controller".into(),
+            disconnect_tx: Some(disconnect_tx),
+        };
+        let (shutdown_tx, shutdown) = bounded(0);
+        let (done, finished) = std_mpsc::channel();
+        let actor = thread::spawn(move || {
+            let mut subscribers = HashMap::from([(
+                "controller".into(),
+                Subscriber {
+                    events: events_tx,
+                    disconnected,
+                    role: AttachmentRole::Controller,
+                    last_control: 1,
+                },
+            )]);
+            let mut controller = Some("controller".into());
+            let mut generation = 1;
+            broadcast(
+                &shutdown,
+                &mut subscribers,
+                &mut controller,
+                &mut generation,
+                StreamEvent::TitleChanged {
+                    title: "blocked".into(),
+                },
+            );
+            let removed = subscribers.is_empty() && controller.is_none();
+            let _ = messages.recv(); // Release the actor queue's occupied slot.
+            let detached = matches!(messages.recv_timeout(Duration::from_secs(1)),
+                Ok(ActorMessage::Detach { attachment_id }) if attachment_id == "controller");
+            let _ = done.send(removed && detached);
+        });
+        let dropper = thread::spawn(move || drop(attachment));
+        let progress = finished.recv_timeout(Duration::from_secs(1));
+        // A red regression can always unwind without leaking worker threads.
+        drop(shutdown_tx);
+        actor.join().unwrap();
+        dropper.join().unwrap();
+        assert_eq!(progress, Ok(true));
+        assert_eq!(retained_events.len(), 1);
+    }
+
+    #[test]
+    fn stale_detach_does_not_remove_a_live_replacement() {
+        let (actor, _writer) = test_actor();
+        let attach = || {
+            actor
+                .request(|reply| ActorMessage::Attach {
+                    offset: 0,
+                    attachment_id: "shared".into(),
+                    role: AttachmentRole::Controller,
+                    takeover: false,
+                    reply,
+                })
+                .unwrap()
+        };
+        let old = attach();
+        let current = attach();
+        drop(old);
+        actor
+            .actor_tx
+            .send(ActorMessage::Detach {
+                attachment_id: "shared".into(),
+            })
+            .unwrap();
+        let replacement = actor.request(|reply| ActorMessage::Control {
+            attachment_id: "shared".into(),
+            cols: 80,
+            rows: 24,
+            bytes: None,
+            reply,
+        });
+        drop(current);
+        actor
+            .actor_tx
+            .send(ActorMessage::Detach {
+                attachment_id: "shared".into(),
+            })
+            .unwrap();
+        let detached = actor.request(|reply| ActorMessage::Control {
+            attachment_id: "shared".into(),
+            cols: 80,
+            rows: 24,
+            bytes: None,
+            reply,
+        });
+        actor.shutdown().unwrap();
+        assert!(replacement.is_ok());
+        assert!(detached.is_err());
+    }
+
+    #[test]
+    fn broadcast_removes_failed_observers_before_promoting() {
+        let mut subscribers = HashMap::new();
+        let mut receivers = HashMap::new();
+        let mut disconnects = Vec::new();
+        for id in ["a", "b"] {
+            let (events, receiver) = bounded(1);
+            events
+                .send(StreamEvent::TitleChanged {
+                    title: "queued".into(),
+                })
+                .unwrap();
+            let (disconnect, disconnected) = bounded(0);
+            disconnects.push(disconnect);
+            receivers.insert(id.to_string(), receiver);
+            subscribers.insert(
+                id.to_string(),
+                Subscriber {
+                    events,
+                    disconnected,
+                    role: AttachmentRole::Observer,
+                    last_control: 1,
+                },
+            );
+        }
+        // Force the failed controller to precede the full observer in iteration
+        // order, regardless of HashMap's randomized seed.
+        let first = subscribers.keys().next().unwrap().clone();
+        subscribers.get_mut(&first).unwrap().role = AttachmentRole::Controller;
+        drop(receivers.remove(&first));
+        let (shutdown_tx, shutdown) = bounded(0);
+        let (done, finished) = std_mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut controller = Some(first);
+            let mut generation = 1;
+            broadcast(
+                &shutdown,
+                &mut subscribers,
+                &mut controller,
+                &mut generation,
+                StreamEvent::TitleChanged {
+                    title: "next".into(),
+                },
+            );
+            let _ = done.send(subscribers.is_empty() && controller.is_none() && generation == 2);
+        });
+        let progress = finished.recv_timeout(Duration::from_secs(1));
+        drop(shutdown_tx);
+        worker.join().unwrap();
+        assert_eq!(progress, Ok(true));
     }
 
     #[test]
@@ -2054,6 +2321,7 @@ mod tests {
     #[test]
     fn controller_backpressures_instead_of_disconnecting() {
         let (_shutdown_tx, shutdown) = bounded(0);
+        let (_disconnect_tx, disconnected) = bounded(0);
         let (events_tx, events) = bounded(1);
         events_tx
             .send(StreamEvent::Output {
@@ -2066,6 +2334,7 @@ mod tests {
             "controller".to_string(),
             Subscriber {
                 events: events_tx,
+                disconnected,
                 role: AttachmentRole::Controller,
                 last_control: 1,
             },
@@ -2101,6 +2370,7 @@ mod tests {
     #[test]
     fn slow_observer_is_disconnected() {
         let (_shutdown_tx, shutdown) = bounded(0);
+        let (_disconnect_tx, disconnected) = bounded(0);
         let (events_tx, _events) = bounded(1);
         events_tx
             .send(StreamEvent::Output {
@@ -2113,6 +2383,7 @@ mod tests {
             "observer".to_string(),
             Subscriber {
                 events: events_tx,
+                disconnected,
                 role: AttachmentRole::Observer,
                 last_control: 0,
             },
