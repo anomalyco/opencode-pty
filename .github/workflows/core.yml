@@ -26,11 +26,15 @@ jobs:
         run: rustup toolchain install nightly-2026-09-02 --profile minimal --component miri --component rust-src
       - run: cargo +nightly-2026-09-02 miri setup
       - name: Check Stacked Borrows
-        run: cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+        run: |
+          cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+          cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/transport-retained/Cargo.toml
       - name: Check Tree Borrows
         env:
           MIRIFLAGS: -Zmiri-tree-borrows
-        run: cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+        run: |
+          cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/ghostty-effects/Cargo.toml
+          cargo +nightly-2026-09-02 miri test --locked --manifest-path tests/transport-retained/Cargo.toml
 
   test:
     name: Core (${{ matrix.os }})
