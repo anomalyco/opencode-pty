@@ -69,7 +69,7 @@ jobs:
           if (!$source.Contains($old)) { throw 'Zig alignment workaround no longer matches; re-evaluate it' }
           [System.IO.File]::WriteAllText($file, $source.Replace($old, '@ptrCast(@alignCast(try si.loadNtdllProc(@tagName(proc))))'))
       - name: Install Rust toolchain and target
-        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --force-non-host --profile minimal --component rustfmt --target $env:CARGO_BUILD_TARGET
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --force-non-host --profile minimal --component rustfmt --component clippy --target $env:CARGO_BUILD_TARGET
       - name: Verify runner and compiler architecture
         env:
           EXPECTED_ARCH: ${{ matrix.arch }}
@@ -91,6 +91,8 @@ jobs:
           cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --check
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Build executable
         id: build
         run: cargo build --locked
@@ -120,6 +122,10 @@ jobs:
         if: failure() && steps.tests.outcome == 'failure'
         timeout-minutes: 10
         run: cargo test --locked --lib --all-features -- --test-threads=1 --nocapture
+      - name: Diagnose failed runtime tests
+        if: failure() && steps.tests.outcome == 'failure'
+        timeout-minutes: 3
+        run: cargo test --locked --test runtime -- --test-threads=1 --nocapture
       - name: Smoke test executable
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -139,8 +145,9 @@ jobs:
 
           Target: $env:CARGO_BUILD_TARGET
 
-          This job builds the executable and runs all enabled tests natively, including libghostty parser and protocol tests.
-          The existing service, ownership, playground, and rows integration suites are Unix-only; they do not exercise Windows yet.
-          A passing run does not imply Windows named-pipe transport or ConPTY lifecycle support is implemented.
+          This job builds the executable and runs all enabled tests natively, including libghostty parser, protocol, and direct TerminalService ConPTY runtime tests.
+          The runtime suite spawns real Rust console children and checks input/output, Unicode, cwd/environment/argv/PATH, OS resize, snapshots, replay, terminal replies, and independent terminals.
+          The older service, ownership, playground, and rows integration suites remain Unix-only.
+          A passing run does not imply Windows named-pipe transport or complete ConPTY shutdown coverage is implemented.
           No packages or releases are published.
           "@ >> $env:GITHUB_STEP_SUMMARY

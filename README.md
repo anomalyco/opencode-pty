@@ -247,10 +247,27 @@ It checks formatting, builds the executable, runs all enabled tests, and checks
 the build tree and runs it without Cargo's DLL search paths, verifying that
 libghostty is statically linked. It does not publish packages or releases.
 
-The current service, ownership, playground, and rows integration suites are
+`tests/runtime.rs` exercises `TerminalService` directly on both Unix and Windows,
+using real self-spawned Rust console children. It covers input/output, Unicode,
+cwd/environment/argument and executable-path handling, OS console resize,
+snapshots, bounded replay, terminal replies, and independent terminals. ConPTY
+can consume application terminal queries itself; the tests also check its
+cursor-inheritance query reaches our Ghostty parser/writer path.
+
+The reusable fixture in `tests/support/terminal_fixture.rs` returns a
+`CreateTerminal` request and uses a separate control/observation channel, so
+daemon tests can reuse it without a shell or Rust client. Include it as
+`terminal_fixture`, call `Fixture::request`, create the terminal, then call
+`Fixture::connect`. `Command::Output` writes real console stdout; `Command::Read`
+observes actual console stdin without echo; `Size` and `Context` inspect the
+child's OS console and process context. The ignored `child` test is only its
+subprocess entry point, not skipped runtime coverage.
+
+The older service, ownership, playground, and rows integration suites remain
 Unix-only. Windows library tests also exercise real named-pipe roundtrips,
 multiple connections, namespace ownership, cancellation, and final-frame
-completion. They do not yet verify Windows daemon or ConPTY lifecycle support.
+completion. These checks do not yet establish Windows daemon support or
+complete ConPTY shutdown behavior.
 
 Once the workflow is on `master`, it can also be run manually against a branch:
 
