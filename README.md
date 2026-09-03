@@ -313,6 +313,18 @@ gh run list --repo anomalyco/opencode-pty --workflow windows.yml --branch window
 gh run view RUN_ID --repo anomalyco/opencode-pty --log-failed
 ```
 
+Manual Windows dispatches can optionally supply `probe_source_gzip_base64` and
+`probe_source_sha256` for a temporary diagnostic test. Ordinary PR/push runs
+never execute this path. The hook accepts at most 24,000 encoded characters and
+256 KiB of decompressed, strict UTF-8 source, verifies its SHA-256, and creates
+only the reserved untracked `tests/windows-probe.rs` path (refusing an existing
+entry). After the normal committed tests, it runs that target with a five-minute
+step limit and removes exactly its generated source file in `finally`.
+The payload is masked before it enters the step environment; the hook logs its
+digest, target architecture, and results, not its source. Checkout credentials
+are not persisted, workflow permissions stay read-only, and diagnostic runs do
+not save Rust build caches or publish/upload their source or packages.
+
 ## Releases
 
 Pushing a `vX.Y.Z` tag matching the version in `Cargo.toml` creates an unsigned
