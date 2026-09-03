@@ -718,11 +718,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
-                for response in terminal.take_writes() {
-                    writes
-                        .send(WriterMessage::Bytes(response))
-                        .map_err(|_| anyhow!("terminal writer stopped"))?;
-                }
+                forward_replies(&mut terminal, &writes)?;
                 update_offsets(&info, &replay);
                 broadcast(
                     &mut subscribers,
@@ -778,7 +774,9 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         pixel_width: 0,
                         pixel_height: 0,
                     })?;
-                    terminal.resize(cols, rows)?;
+                    let resized = terminal.resize(cols, rows);
+                    forward_replies(&mut terminal, &writes)?;
+                    resized?;
                     if let Ok(mut value) = info.write() {
                         value.cols = cols;
                         value.rows = rows;
@@ -845,7 +843,9 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                             pixel_width: 0,
                             pixel_height: 0,
                         })?;
-                        terminal.resize(cols, rows)?;
+                        let resized = terminal.resize(cols, rows);
+                        forward_replies(&mut terminal, &writes)?;
+                        resized?;
                         if let Ok(mut value) = info.write() {
                             value.cols = cols;
                             value.rows = rows;
@@ -1154,6 +1154,18 @@ fn process_depth(pid: i32, parents: &HashMap<i32, i32>) -> usize {
     seen.len()
 }
 
+// Forward effects immediately after each native mutation, even if it reports an
+// error. In particular, resize notifications must precede any accompanying input.
+// Actual PTY I/O remains on the single writer thread, never inside a callback.
+fn forward_replies(terminal: &mut Terminal, writes: &Sender<WriterMessage>) -> Result<()> {
+    for response in terminal.take_writes() {
+        writes
+            .send(WriterMessage::Bytes(response))
+            .map_err(|_| anyhow!("terminal writer stopped"))?;
+    }
+    Ok(())
+}
+
 fn run_writer(
     mut writer: Box<dyn Write + Send>,
     writer_rx: Receiver<WriterMessage>,
@@ -1387,6 +1399,29 @@ mod tests {
         .unwrap();
         terminal.vt_write(input.as_bytes());
         terminal
+    }
+
+    #[test]
+    fn forwarding_replies_drains_once_and_reports_writer_failure() {
+        let mut terminal = rows_terminal(10, 3, "\x1b[5n\x1b[6n");
+        let (writes, reader) = bounded(4);
+        forward_replies(&mut terminal, &writes).unwrap();
+        for expected in [b"\x1b[0n".as_slice(), b"\x1b[1;1R".as_slice()] {
+            let WriterMessage::Bytes(bytes) = reader.try_recv().unwrap();
+            assert_eq!(bytes, expected);
+        }
+        assert!(reader.try_recv().is_err());
+        assert!(terminal.take_writes().is_empty());
+
+        terminal.vt_write(b"\x1b[5n");
+        drop(reader);
+        assert_eq!(
+            forward_replies(&mut terminal, &writes)
+                .unwrap_err()
+                .to_string(),
+            "terminal writer stopped",
+        );
+        assert!(terminal.take_writes().is_empty());
     }
 
     #[test]
