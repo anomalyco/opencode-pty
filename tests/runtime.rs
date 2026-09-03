@@ -236,6 +236,16 @@ fn independent_terminals_keep_bounded_replay() {
 
 #[test]
 fn normal_exit_follows_final_output_and_preserves_exit_code() {
+    check_normal_exit(23);
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_exit_code_259_is_not_mistaken_for_a_running_child() {
+    check_normal_exit(259);
+}
+
+fn check_normal_exit(code: u32) {
     let _deadline = Deadline::new();
     let fixture = Fixture::new();
     let service = TerminalService::default();
@@ -253,7 +263,7 @@ fn normal_exit_follows_final_output_and_preserves_exit_code() {
     let mut bytes = observer.replay.bytes.clone();
     let mut offset = observer.replay.end_offset;
     child.command(Command::Output("\r\nFINAL_OUTPUT_BEFORE_EXIT\r\n".into()));
-    child.command(Command::Exit(23));
+    child.command(Command::Exit(code as i32));
     loop {
         match observer
             .events
@@ -278,7 +288,7 @@ fn normal_exit_follows_final_output_and_preserves_exit_code() {
                 exit_code,
                 final_offset,
             } => {
-                assert_eq!(exit_code, Some(23));
+                assert_eq!(exit_code, Some(code));
                 assert_eq!(final_offset, offset);
                 break;
             }
@@ -294,11 +304,34 @@ fn normal_exit_follows_final_output_and_preserves_exit_code() {
     assert_eq!(
         snapshot.info.lifecycle,
         TerminalLifecycle::Exited {
-            exit_code: Some(23)
+            exit_code: Some(code)
         }
     );
     assert_eq!(snapshot.info.output_tail, offset);
     assert!(observer.events.try_recv().is_err());
+    #[cfg(windows)]
+    {
+        assert!(
+            service
+                .resize(info.id, 100, 40)
+                .unwrap_err()
+                .to_string()
+                .contains("child has exited")
+        );
+        assert!(service.write(info.id, b"late input".to_vec()).is_err());
+        assert_eq!(
+            service.snapshot(info.id).unwrap().info.lifecycle,
+            snapshot.info.lifecycle
+        );
+        assert!(
+            service
+                .read_rows(info.id, None)
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.contains("FINAL_OUTPUT_BEFORE_EXIT"))
+        );
+    }
     drop(observer);
     service.terminate(info.id).unwrap();
 }

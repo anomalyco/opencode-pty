@@ -269,6 +269,14 @@ multiple connections, namespace ownership, cancellation, and final-frame
 completion. These checks do not yet establish Windows daemon support or
 complete ConPTY shutdown behavior.
 
+On Windows, normal root-child exit hands the ConPTY master to the existing
+child-wait worker for closing. The actor and reader continue draining until the
+real output-pipe EOF; only then is the final exit event published. Detecting the
+root's exit adds at most 10 ms of polling latency. After the master is handed
+off, Windows input and resize requests fail with a child-exited error; final
+snapshots, rows, and replay remain readable until the terminal is removed.
+Unix post-exit PTY operations retain their existing behavior.
+
 ### Known Linux cleanup limitation
 
 A child that exits without consuming a large queued PTY write can leave the
