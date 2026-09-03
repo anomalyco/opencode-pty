@@ -713,19 +713,25 @@ impl ActorMaster {
     }
 
     #[cfg(windows)]
-    fn close(&mut self) {
+    fn close(&mut self) -> Result<()> {
         if let Some(master) = self.pty.take() {
             // A capacity-one channel receives this unique master exactly once;
             // handoff cannot wait on ClosePseudoConsole or PTY output drainage.
-            let _ = self.close_tx.send(master);
+            if let Err(error) = self.close_tx.send(master) {
+                // Keep ownership on failure. The actor stops receiving before
+                // dropping this fallback master, so its reader can still drain.
+                self.pty = Some(error.0);
+                bail!("terminal close worker stopped");
+            }
         }
+        Ok(())
     }
 }
 
 impl Drop for ActorMaster {
     fn drop(&mut self) {
         #[cfg(windows)]
-        self.close();
+        let _ = self.close();
     }
 }
 
@@ -1056,7 +1062,9 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                 // The wait worker closes it while this actor and the reader
                 // keep processing output, including the real final EOF.
                 #[cfg(windows)]
-                master.close();
+                if let Err(error) = master.close() {
+                    break Err(error);
+                }
             }
             Ok(ActorMessage::ReaderFailed(message)) | Ok(ActorMessage::WriterFailed(message)) => {
                 // Closing ConPTY can finish a pending write with BrokenPipe
@@ -1692,6 +1700,19 @@ mod tests {
             actor.shutdown().unwrap();
             actor.shutdown().unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn failed_close_handoff_retains_master_ownership() {
+        let (close_tx, close_rx) = bounded(1);
+        drop(close_rx);
+        let mut master = ActorMaster {
+            pty: Some(Box::new(TestMaster)),
+            close_tx,
+        };
+        assert!(master.close().is_err());
+        assert!(master.get().is_ok());
     }
 
     #[test]
