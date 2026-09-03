@@ -59,4 +59,4 @@ jobs:
       # Match the release workflow's macOS playground exclusion.
       - name: Test macOS
         if: runner.os == 'macOS'
-        run: cargo test --locked --lib --test service --test ownership --test rows
+        run: cargo test --locked --lib --test service --test ownership --test rows --test ghostty-effects
