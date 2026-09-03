@@ -233,19 +233,23 @@ mod unix {
                     .map_err(|_| anyhow!("ownership lock poisoned"))?
                     .claim(ticket.as_deref(), Instant::now())
             };
-            if let Err(error) = claim {
-                return write_frame(
-                    &mut stream,
-                    &Response::Error {
-                        message: error.to_string(),
-                    },
-                );
-            }
-            let result = owner_connection(&mut stream, registration, shutdown, ownership);
+            let generation = match claim {
+                Ok(generation) => generation,
+                Err(error) => {
+                    return write_frame(
+                        &mut stream,
+                        &Response::Error {
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            };
+            let result =
+                owner_connection(&mut stream, registration, shutdown, ownership, generation);
             ownership
                 .lock()
                 .map_err(|_| anyhow!("ownership lock poisoned"))?
-                .disconnect(Instant::now());
+                .disconnect(generation, Instant::now());
             return result;
         }
         if let Request::Subscribe {
@@ -287,10 +291,23 @@ mod unix {
         registration: &Registration,
         shutdown: &AtomicBool,
         ownership: &Mutex<Ownership>,
+        generation: u64,
     ) -> Result<()> {
         write_frame(&mut *stream, &Response::Owned)?;
         while !shutdown.load(Ordering::Acquire) {
             let envelope: Envelope = read_frame(&mut *stream)?;
+            if !ownership
+                .lock()
+                .map_err(|_| anyhow!("ownership lock poisoned"))?
+                .is_owner(generation)
+            {
+                return write_frame(
+                    &mut *stream,
+                    &Response::Error {
+                        message: "owner connection has been superseded".to_string(),
+                    },
+                );
+            }
             let stopping = envelope.token == registration.token
                 && matches!(envelope.request, Request::Shutdown);
             let response = if envelope.token != registration.token {
@@ -304,6 +321,7 @@ mod unix {
                             .lock()
                             .map_err(|_| anyhow!("ownership lock poisoned"))?
                             .prepare(
+                                generation,
                                 Instant::now(),
                                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
                             )?;
@@ -321,7 +339,13 @@ mod unix {
             };
             let result = write_frame(&mut *stream, &response);
             if stopping {
-                shutdown.store(true, Ordering::Release);
+                // A takeover may have occurred while writing the response.
+                let owner = ownership
+                    .lock()
+                    .map_err(|_| anyhow!("ownership lock poisoned"))?;
+                if owner.is_owner(generation) {
+                    shutdown.store(true, Ordering::Release);
+                }
                 return result;
             }
             result?;
