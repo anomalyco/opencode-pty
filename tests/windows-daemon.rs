@@ -82,7 +82,7 @@ impl Daemon {
         (stream, response)
     }
 
-    fn create(&self, fixture: &Fixture) -> TerminalInfo {
+    fn create(&self, request: CreateTerminal) -> TerminalInfo {
         let CreateTerminal {
             program,
             args,
@@ -92,7 +92,7 @@ impl Daemon {
             env,
             cols,
             rows,
-        } = fixture.request();
+        } = request;
         match self.request(Request::Create {
             program,
             args,
@@ -318,28 +318,7 @@ fn named_pipe_daemon_create_input_output_resize_and_shutdown() {
     let executable = daemon.root.executable("daemon fixture.exe");
     let mut request = fixture.request();
     request.program = executable.to_str().unwrap().into();
-    let CreateTerminal {
-        program,
-        args,
-        cwd,
-        title,
-        group_id,
-        env,
-        cols,
-        rows,
-    } = request;
-    let Response::Created { terminal } = daemon.request(Request::Create {
-        program,
-        args,
-        cwd,
-        title,
-        group_id,
-        env,
-        cols,
-        rows,
-    }) else {
-        panic!("create response");
-    };
+    let terminal = daemon.create(request);
     let mut child = fixture.connect();
     let mut subscription = daemon.subscribe(terminal.id, AttachmentRole::Observer);
     child.command(FixtureCommand::Output("\x1b[2J\x1b[Hdaemon-output".into()));
@@ -395,7 +374,7 @@ fn owner_loss_cancels_blocked_subscriber_and_partial_request() {
     let (owner, response) = daemon.own(None);
     assert!(matches!(response, Response::Owned));
     let fixture = Fixture::new();
-    let terminal = daemon.create(&fixture);
+    let terminal = daemon.create(fixture.request());
     let mut child = fixture.connect();
     // SAFETY: open the live child for waiting; PID is only used to obtain a
     // stable process handle for this assertion, not as terminal identity.
@@ -422,7 +401,7 @@ fn natural_exit_delivers_contiguous_output_and_retains_final_state() {
     let (owner, response) = daemon.own(None);
     assert!(matches!(response, Response::Owned));
     let fixture = Fixture::new();
-    let terminal = daemon.create(&fixture);
+    let terminal = daemon.create(fixture.request());
     let mut child = fixture.connect();
     // Capture a stable process handle before exit; the PID is not terminal identity.
     let process = unsafe {
@@ -576,8 +555,8 @@ fn observer_disconnect_and_control_input_preserve_independent_terminals() {
     assert!(matches!(response, Response::Owned));
     let first_fixture = Fixture::new();
     let second_fixture = Fixture::new();
-    let first = daemon.create(&first_fixture);
-    let second = daemon.create(&second_fixture);
+    let first = daemon.create(first_fixture.request());
+    let second = daemon.create(second_fixture.request());
     assert_ne!(first.id, second.id);
     let mut first_child = first_fixture.connect();
     let mut second_child = second_fixture.connect();

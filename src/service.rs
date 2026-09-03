@@ -224,6 +224,9 @@ impl TerminalService {
             .collect::<Vec<_>>();
         let mut terminals = Vec::with_capacity(handles.len());
         for terminal in handles {
+            // Windows has no foreground query; do not wait behind actor
+            // backpressure just to read its already-cached metadata.
+            #[cfg(not(windows))]
             terminal.request(|reply| ActorMessage::RefreshForegroundProcess { reply })?;
             terminals.push(terminal.info());
         }
@@ -645,6 +648,7 @@ enum ActorMessage {
     ReaderFailed(String),
     WriterFailed(String),
     ChildExited(Result<Option<u32>, String>),
+    #[cfg(not(windows))]
     RefreshForegroundProcess {
         reply: std_mpsc::SyncSender<Result<()>>,
     },
@@ -796,6 +800,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
 
     let result = loop {
         match receive_actor_message(&messages, &mut pending_message, &shutdown) {
+            #[cfg(not(windows))]
             Ok(ActorMessage::RefreshForegroundProcess { reply }) => {
                 if let Ok(master) = master.get() {
                     publish_foreground_process(
@@ -1193,6 +1198,7 @@ fn receive_actor_message(
     Ok(ActorMessage::Output(bytes))
 }
 
+#[cfg(not(windows))]
 fn publish_foreground_process(
     shutdown: &Receiver<()>,
     master: &dyn MasterPty,
@@ -1257,7 +1263,7 @@ fn foreground_process(master: &dyn MasterPty) -> Option<String> {
         .map(|process| process.name.clone())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn foreground_process(_master: &dyn MasterPty) -> Option<String> {
     None
 }
@@ -1696,6 +1702,22 @@ mod tests {
             },
             writer_rx,
         )
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_list_reads_metadata_without_an_actor_request() {
+        let (actor, _writer) = test_actor();
+        actor.shutdown().unwrap();
+        let service = TerminalService::default();
+        service.terminals.lock().unwrap().insert(1, Arc::new(actor));
+
+        // Even a closed actor channel is irrelevant to cached Windows metadata.
+        let terminals = service.list().unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].id, 1);
+        assert_eq!(terminals[0].title, "test");
+        assert!(terminals[0].foreground_process.is_none());
     }
 
     #[test]
