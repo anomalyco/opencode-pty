@@ -269,6 +269,15 @@ multiple connections, namespace ownership, cancellation, and final-frame
 completion. These checks do not yet establish Windows daemon support or
 complete ConPTY shutdown behavior.
 
+### Known Linux cleanup limitation
+
+A child that exits without consuming a large queued PTY write can leave the
+Linux master write blocked after the child, actor, reader, and waiter have
+already stopped. `TerminalService::terminate` or service drop can then wait
+indefinitely for the writer thread. This pre-existing Unix I/O limitation is
+not repaired by the Windows cleanup work. A test watchdog or the daemon's
+forced-exit deadline does not prove that those worker threads were joined.
+
 Once the workflow is on `master`, it can also be run manually against a branch:
 
 ```sh

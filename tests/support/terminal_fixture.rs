@@ -26,6 +26,7 @@ pub enum Command {
     Size,
     Context,
     Exit(i32),
+    Flood,
 }
 
 pub struct Fixture {
@@ -162,6 +163,7 @@ fn child() {
             }
             Command::Size => serde_json::json!(console_size()),
             Command::Context => serde_json::json!({
+                "pid": std::process::id(),
                 "cwd": env::current_dir().unwrap(),
                 "args": env::args().skip(1).collect::<Vec<_>>(),
                 "value": env::var("PTY_FIXTURE_VALUE").ok(),
@@ -171,6 +173,15 @@ fn child() {
             Command::Exit(code) => {
                 send(channel.get_mut(), &serde_json::Value::Null);
                 std::process::exit(code);
+            }
+            Command::Flood => {
+                send(channel.get_mut(), &serde_json::Value::Null);
+                let mut stdout = io::stdout().lock();
+                let chunk = "FLOOD_OUTPUT\r\n".repeat(256);
+                loop {
+                    stdout.write_all(chunk.as_bytes()).unwrap();
+                    stdout.flush().unwrap();
+                }
             }
         };
         send(channel.get_mut(), &result);

@@ -400,6 +400,7 @@ impl Drop for TerminalService {
 
 struct TerminalHandle {
     actor_tx: Sender<ActorMessage>,
+    shutdown_tx: Mutex<Option<Sender<()>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     info: Arc<RwLock<TerminalInfo>>,
     joins: Mutex<Option<Vec<JoinHandle<()>>>>,
@@ -461,10 +462,14 @@ impl TerminalHandle {
 
         let (actor_tx, actor_rx) = bounded(ACTOR_QUEUE_CAPACITY);
         let (writer_tx, writer_rx) = bounded(WRITER_QUEUE_CAPACITY);
+        // Disconnecting this channel wakes every cancellable queue operation,
+        // even when the actor cannot consume an ordinary shutdown message.
+        let (shutdown_tx, shutdown) = bounded(0);
         let (init_tx, init_rx) = std_mpsc::sync_channel(1);
 
         let actor_info = Arc::clone(&info);
         let actor_writer_tx = writer_tx.clone();
+        let actor_shutdown = shutdown.clone();
         let actor_thread = thread::Builder::new()
             .name(format!("opencode-pty-actor-{id}"))
             .spawn(move || {
@@ -472,6 +477,7 @@ impl TerminalHandle {
                     master: pair.master,
                     messages: actor_rx,
                     writes: actor_writer_tx,
+                    shutdown: actor_shutdown,
                     info: actor_info,
                     replay_capacity,
                     cols: request.cols,
@@ -500,7 +506,7 @@ impl TerminalHandle {
         let writer_actor_tx = actor_tx.clone();
         let writer_thread = thread::Builder::new()
             .name(format!("opencode-pty-writer-{id}"))
-            .spawn(move || run_writer(writer, writer_rx, writer_actor_tx))
+            .spawn(move || run_writer(writer, writer_rx, writer_actor_tx, shutdown))
             .context("failed to spawn terminal writer")?;
 
         let reader_actor_tx = actor_tx.clone();
@@ -508,6 +514,7 @@ impl TerminalHandle {
             .name(format!("opencode-pty-reader-{id}"))
             .spawn(move || {
                 let mut buffer = [0_u8; 8192];
+                let mut forwarding = true;
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => {
@@ -515,12 +522,18 @@ impl TerminalHandle {
                             break;
                         }
                         Ok(length) => {
-                            if reader_actor_tx
-                                .send(ActorMessage::Output(buffer[..length].to_vec()))
-                                .is_err()
-                            {
-                                break;
+                            if forwarding {
+                                forwarding = reader_actor_tx
+                                    .send(ActorMessage::Output(buffer[..length].to_vec()))
+                                    .is_ok();
+                                #[cfg(unix)]
+                                if !forwarding {
+                                    break;
+                                }
                             }
+                            // On Windows, ClosePseudoConsole can wait for its
+                            // output pipe to drain. Once the actor stops, keep
+                            // this sole reader draining without forwarding.
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         #[cfg(unix)]
@@ -551,6 +564,7 @@ impl TerminalHandle {
 
         Ok(Self {
             actor_tx,
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
             killer: Mutex::new(killer),
             info,
             joins: Mutex::new(Some(vec![
@@ -581,17 +595,23 @@ impl TerminalHandle {
     }
 
     fn shutdown(&self) -> Result<()> {
+        // Keep this guard through the joins: concurrent shutdown callers must
+        // not return early or signal the child again after it has been reaped.
+        let mut joins = self
+            .joins
+            .lock()
+            .map_err(|_| anyhow!("terminal join lock poisoned"))?;
+        let Some(handles) = joins.take() else {
+            return Ok(());
+        };
+        self.shutdown_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Ok(mut killer) = self.killer.lock() {
             let _ = killer.kill();
         }
-        let _ = self.actor_tx.send(ActorMessage::Shutdown);
-        let joins = self
-            .joins
-            .lock()
-            .map_err(|_| anyhow!("terminal join lock poisoned"))?
-            .take()
-            .unwrap_or_default();
-        for join in joins {
+        for join in handles {
             let _ = join.join();
         }
         Ok(())
@@ -646,7 +666,6 @@ enum ActorMessage {
     Detach {
         attachment_id: String,
     },
-    Shutdown,
 }
 
 struct Attached {
@@ -669,6 +688,7 @@ struct ActorConfig {
     master: Box<dyn MasterPty + Send>,
     messages: Receiver<ActorMessage>,
     writes: Sender<WriterMessage>,
+    shutdown: Receiver<()>,
     info: Arc<RwLock<TerminalInfo>>,
     replay_capacity: usize,
     cols: u16,
@@ -681,6 +701,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
         master,
         messages,
         writes,
+        shutdown,
         info,
         replay_capacity,
         cols,
@@ -703,10 +724,11 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     let mut pending_message = None;
     let _ = init_tx.send(Ok(()));
 
-    loop {
-        match receive_actor_message(&messages, &mut pending_message) {
+    let result = loop {
+        match receive_actor_message(&messages, &mut pending_message, &shutdown) {
             Ok(ActorMessage::RefreshForegroundProcess { reply }) => {
                 publish_foreground_process(
+                    &shutdown,
                     &*master,
                     &info,
                     &mut subscribers,
@@ -718,9 +740,12 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
-                forward_replies(&mut terminal, &writes)?;
+                if let Err(error) = forward_replies(&mut terminal, &writes, &shutdown) {
+                    break Err(error);
+                }
                 update_offsets(&info, &replay);
                 broadcast(
+                    &shutdown,
                     &mut subscribers,
                     &mut controller,
                     &mut controller_generation,
@@ -739,6 +764,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     };
                     if changed {
                         broadcast(
+                            &shutdown,
                             &mut subscribers,
                             &mut controller,
                             &mut controller_generation,
@@ -752,12 +778,8 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                 bytes,
                 reply,
             }) => {
-                let result =
-                    authorize_controller(&controller, attachment_id.as_deref()).and_then(|_| {
-                        writes
-                            .send(WriterMessage::Bytes(bytes))
-                            .map_err(|_| anyhow!("terminal writer stopped"))
-                    });
+                let result = authorize_controller(&controller, attachment_id.as_deref())
+                    .and_then(|_| queue_write(&writes, &shutdown, bytes));
                 let _ = reply.send(result);
             }
             Ok(ActorMessage::Resize {
@@ -775,7 +797,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         pixel_height: 0,
                     })?;
                     let resized = terminal.resize(cols, rows);
-                    forward_replies(&mut terminal, &writes)?;
+                    forward_replies(&mut terminal, &writes, &shutdown)?;
                     resized?;
                     if let Ok(mut value) = info.write() {
                         value.cols = cols;
@@ -784,6 +806,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     let generation = controller_generation;
                     let checkpoint = format_terminal(&terminal, Format::Vt)?.into_bytes();
                     broadcast(
+                        &shutdown,
                         &mut subscribers,
                         &mut controller,
                         &mut controller_generation,
@@ -823,6 +846,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         }
                         let generation = controller_generation;
                         broadcast(
+                            &shutdown,
                             &mut subscribers,
                             &mut controller,
                             &mut controller_generation,
@@ -844,7 +868,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                             pixel_height: 0,
                         })?;
                         let resized = terminal.resize(cols, rows);
-                        forward_replies(&mut terminal, &writes)?;
+                        forward_replies(&mut terminal, &writes, &shutdown)?;
                         resized?;
                         if let Ok(mut value) = info.write() {
                             value.cols = cols;
@@ -853,6 +877,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         let generation = controller_generation;
                         let checkpoint = format_terminal(&terminal, Format::Vt)?.into_bytes();
                         broadcast(
+                            &shutdown,
                             &mut subscribers,
                             &mut controller,
                             &mut controller_generation,
@@ -865,9 +890,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         );
                     }
                     if let Some(bytes) = bytes {
-                        writes
-                            .send(WriterMessage::Bytes(bytes))
-                            .map_err(|_| anyhow!("terminal writer stopped"))?;
+                        queue_write(&writes, &shutdown, bytes)?;
                     }
                     Ok(())
                 })();
@@ -935,6 +958,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         let controller_id = controller.clone();
                         let generation = controller_generation;
                         broadcast(
+                            &shutdown,
                             &mut subscribers,
                             &mut controller,
                             &mut controller_generation,
@@ -960,6 +984,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                     let generation = controller_generation;
                     let attachment_id = controller.clone();
                     broadcast(
+                        &shutdown,
                         &mut subscribers,
                         &mut controller,
                         &mut controller_generation,
@@ -979,8 +1004,8 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                 }
             }
             Ok(ActorMessage::ReaderEof) => reader_eof = true,
-            Ok(ActorMessage::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                break;
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                break Ok(());
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
         }
@@ -996,6 +1021,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                 };
             }
             broadcast(
+                &shutdown,
                 &mut subscribers,
                 &mut controller,
                 &mut controller_generation,
@@ -1006,22 +1032,41 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             );
             exit_published = true;
         }
-    }
+    };
+    // Release senders blocked on the actor queue before closing ConPTY. Its
+    // synchronous close may need the reader to continue draining final output.
+    drop(messages);
     drop(terminal);
     drop(master);
     drop(writes);
-    Ok(())
+    if matches!(
+        shutdown.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ) {
+        // Interrupted terminal-generated replies are expected during shutdown.
+        Ok(())
+    } else {
+        result
+    }
 }
 
 fn receive_actor_message(
     messages: &Receiver<ActorMessage>,
     pending: &mut Option<ActorMessage>,
+    shutdown: &Receiver<()>,
 ) -> std::result::Result<ActorMessage, crossbeam_channel::RecvTimeoutError> {
+    if matches!(
+        shutdown.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ) {
+        return Err(crossbeam_channel::RecvTimeoutError::Disconnected);
+    }
     let message = match pending.take() {
         Some(message) => message,
-        None => messages
-            .recv()
-            .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)?,
+        None => crossbeam_channel::select_biased! {
+            recv(shutdown) -> _ => return Err(crossbeam_channel::RecvTimeoutError::Disconnected),
+            recv(messages) -> message => message.map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)?,
+        },
     };
     let ActorMessage::Output(mut bytes) = message else {
         return Ok(message);
@@ -1042,6 +1087,7 @@ fn receive_actor_message(
 }
 
 fn publish_foreground_process(
+    shutdown: &Receiver<()>,
     master: &dyn MasterPty,
     info: &Arc<RwLock<TerminalInfo>>,
     subscribers: &mut HashMap<String, Subscriber>,
@@ -1061,6 +1107,7 @@ fn publish_foreground_process(
     };
     if changed {
         broadcast(
+            shutdown,
             subscribers,
             controller,
             controller_generation,
@@ -1157,21 +1204,42 @@ fn process_depth(pid: i32, parents: &HashMap<i32, i32>) -> usize {
 // Forward effects immediately after each native mutation, even if it reports an
 // error. In particular, resize notifications must precede any accompanying input.
 // Actual PTY I/O remains on the single writer thread, never inside a callback.
-fn forward_replies(terminal: &mut Terminal, writes: &Sender<WriterMessage>) -> Result<()> {
+fn forward_replies(
+    terminal: &mut Terminal,
+    writes: &Sender<WriterMessage>,
+    shutdown: &Receiver<()>,
+) -> Result<()> {
     for response in terminal.take_writes() {
-        writes
-            .send(WriterMessage::Bytes(response))
-            .map_err(|_| anyhow!("terminal writer stopped"))?;
+        queue_write(writes, shutdown, response)?;
     }
     Ok(())
+}
+
+fn queue_write(
+    writes: &Sender<WriterMessage>,
+    shutdown: &Receiver<()>,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    crossbeam_channel::select_biased! {
+        recv(shutdown) -> _ => bail!("terminal is stopping"),
+        send(writes, WriterMessage::Bytes(bytes)) -> result => result.map_err(|_| anyhow!("terminal writer stopped")),
+    }
 }
 
 fn run_writer(
     mut writer: Box<dyn Write + Send>,
     writer_rx: Receiver<WriterMessage>,
     actor_tx: Sender<ActorMessage>,
+    shutdown: Receiver<()>,
 ) {
-    for message in writer_rx {
+    loop {
+        let message = crossbeam_channel::select_biased! {
+            recv(shutdown) -> _ => break,
+            recv(writer_rx) -> message => match message {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
         let result = match message {
             WriterMessage::Bytes(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
         };
@@ -1306,21 +1374,33 @@ impl ReplayBuffer {
 }
 
 fn broadcast(
+    shutdown: &Receiver<()>,
     subscribers: &mut HashMap<String, Subscriber>,
     controller: &mut Option<String>,
     controller_generation: &mut u64,
     event: StreamEvent,
 ) {
-    let dropped = subscribers
-        .iter()
-        .filter_map(|(id, subscriber)| {
-            let failed = match subscriber.role {
-                AttachmentRole::Controller => subscriber.events.send(event.clone()).is_err(),
-                AttachmentRole::Observer => subscriber.events.try_send(event.clone()).is_err(),
-            };
-            failed.then(|| id.clone())
-        })
-        .collect::<Vec<_>>();
+    let mut dropped = Vec::new();
+    for (id, subscriber) in subscribers.iter() {
+        let failed = match subscriber.role {
+            AttachmentRole::Controller => crossbeam_channel::select_biased! {
+                // Quitting is not a subscriber disconnect: do not promote and
+                // recursively notify controllers while tearing the actor down.
+                recv(shutdown) -> _ => return,
+                send(subscriber.events, event.clone()) -> result => result.is_err(),
+            },
+            AttachmentRole::Observer => subscriber.events.try_send(event.clone()).is_err(),
+        };
+        if failed {
+            dropped.push(id.clone());
+        }
+    }
+    if matches!(
+        shutdown.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ) {
+        return;
+    }
     for id in dropped {
         subscribers.remove(&id);
         if controller.as_ref() == Some(&id) {
@@ -1329,6 +1409,7 @@ fn broadcast(
             let generation = *controller_generation;
             let attachment_id = controller.clone();
             broadcast(
+                shutdown,
                 subscribers,
                 controller,
                 controller_generation,
@@ -1390,6 +1471,218 @@ fn default_shell() -> String {
 mod tests {
     use super::*;
 
+    struct TestMaster;
+
+    impl MasterPty for TestMaster {
+        fn resize(&self, _: PtySize) -> Result<()> {
+            Ok(())
+        }
+        fn get_size(&self) -> Result<PtySize> {
+            Ok(PtySize::default())
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+            unreachable!()
+        }
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
+            unreachable!()
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestKiller;
+
+    impl ChildKiller for TestKiller {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    // Real actor/parser and bounded channels, without OS pipe capacity or a
+    // large output flood. Native child/handle coverage lives in tests/runtime.rs.
+    fn test_actor() -> (TerminalHandle, Receiver<WriterMessage>) {
+        let (actor_tx, messages) = bounded(ACTOR_QUEUE_CAPACITY);
+        let (writes, writer_rx) = bounded(1);
+        let (shutdown_tx, shutdown) = bounded(0);
+        let (init_tx, init_rx) = std_mpsc::sync_channel(1);
+        let info = Arc::new(RwLock::new(TerminalInfo {
+            id: 1,
+            pid: None,
+            title: "test".into(),
+            foreground_process: None,
+            group_id: "test".into(),
+            command: vec![],
+            cwd: PathBuf::new(),
+            cols: 80,
+            rows: 24,
+            lifecycle: TerminalLifecycle::Running,
+            output_head: 0,
+            output_tail: 0,
+        }));
+        let actor_info = Arc::clone(&info);
+        let actor = thread::spawn(move || {
+            run_actor(ActorConfig {
+                master: Box::new(TestMaster),
+                messages,
+                writes,
+                shutdown,
+                info: actor_info,
+                replay_capacity: 4096,
+                cols: 80,
+                rows: 24,
+                init_tx,
+            })
+            .unwrap()
+        });
+        init_rx.recv().unwrap().unwrap();
+        (
+            TerminalHandle {
+                actor_tx,
+                shutdown_tx: Mutex::new(Some(shutdown_tx)),
+                killer: Mutex::new(Box::new(TestKiller)),
+                info,
+                joins: Mutex::new(Some(vec![actor])),
+            },
+            writer_rx,
+        )
+    }
+
+    #[test]
+    fn child_exit_and_reader_eof_are_distinct_actor_signals() {
+        for eof_first in [false, true] {
+            let (actor, _writer) = test_actor();
+            actor
+                .actor_tx
+                .send(if eof_first {
+                    ActorMessage::ReaderEof
+                } else {
+                    ActorMessage::ChildExited(Ok(Some(23)))
+                })
+                .unwrap();
+            let snapshot = actor
+                .request(|reply| ActorMessage::Snapshot { reply })
+                .unwrap();
+            assert_eq!(snapshot.info.lifecycle, TerminalLifecycle::Running);
+            if !eof_first {
+                actor
+                    .actor_tx
+                    .send(ActorMessage::Output(b"final".to_vec()))
+                    .unwrap();
+            }
+            actor
+                .actor_tx
+                .send(if eof_first {
+                    ActorMessage::ChildExited(Ok(Some(23)))
+                } else {
+                    ActorMessage::ReaderEof
+                })
+                .unwrap();
+            let snapshot = actor
+                .request(|reply| ActorMessage::Snapshot { reply })
+                .unwrap();
+            assert_eq!(
+                snapshot.info.lifecycle,
+                TerminalLifecycle::Exited {
+                    exit_code: Some(23)
+                }
+            );
+            if !eof_first {
+                assert_eq!(snapshot.text, "final");
+            }
+            actor.shutdown().unwrap();
+            actor.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_interrupts_controller_backpressure() {
+        let (actor, _writer) = test_actor();
+        let attached = actor
+            .request(|reply| ActorMessage::Attach {
+                offset: 0,
+                attachment_id: "controller".into(),
+                role: AttachmentRole::Controller,
+                takeover: false,
+                reply,
+            })
+            .unwrap();
+        // Attach already queued ControllerChanged. Force one output per batch
+        // with a following actor request, filling the queue with only 1 KiB.
+        for _ in 1..SUBSCRIBER_QUEUE_CAPACITY {
+            actor
+                .actor_tx
+                .send(ActorMessage::Output(b"x".to_vec()))
+                .unwrap();
+            actor
+                .request(|reply| ActorMessage::Replay { offset: 0, reply })
+                .unwrap();
+        }
+        assert!(attached.events.is_full());
+        actor
+            .actor_tx
+            .send(ActorMessage::Output(b"!".to_vec()))
+            .unwrap();
+        let (done, finished) = std_mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            actor.shutdown().unwrap();
+            done.send(()).unwrap();
+        });
+        let stopped = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+        // Release the test consumer even on failure so a red regression never
+        // leaves a thread stuck or depends on the runtime-test watchdog.
+        drop(attached);
+        shutdown.join().unwrap();
+        assert!(
+            stopped,
+            "shutdown waited for a controller to consume output"
+        );
+    }
+
+    #[test]
+    fn shutdown_interrupts_actor_to_writer_backpressure() {
+        let (actor, writer) = test_actor();
+        actor
+            .request(|reply| ActorMessage::Write {
+                attachment_id: None,
+                bytes: b"first".to_vec(),
+                reply,
+            })
+            .unwrap();
+        assert!(writer.is_full());
+        let (reply, _reply_rx) = std_mpsc::sync_channel(1);
+        actor
+            .actor_tx
+            .send(ActorMessage::Write {
+                attachment_id: None,
+                bytes: b"blocked".to_vec(),
+                reply,
+            })
+            .unwrap();
+        let (done, finished) = std_mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            actor.shutdown().unwrap();
+            done.send(()).unwrap();
+        });
+        let stopped = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+        drop(writer);
+        shutdown.join().unwrap();
+        assert!(stopped, "shutdown waited for the full input queue");
+    }
+
     fn rows_terminal(cols: u16, rows: u16, input: &str) -> Terminal {
         let mut terminal = Terminal::new(TerminalOptions {
             cols,
@@ -1405,7 +1698,8 @@ mod tests {
     fn forwarding_replies_drains_once_and_reports_writer_failure() {
         let mut terminal = rows_terminal(10, 3, "\x1b[5n\x1b[6n");
         let (writes, reader) = bounded(4);
-        forward_replies(&mut terminal, &writes).unwrap();
+        let (_shutdown_tx, shutdown) = bounded(0);
+        forward_replies(&mut terminal, &writes, &shutdown).unwrap();
         for expected in [b"\x1b[0n".as_slice(), b"\x1b[1;1R".as_slice()] {
             let WriterMessage::Bytes(bytes) = reader.try_recv().unwrap();
             assert_eq!(bytes, expected);
@@ -1416,7 +1710,7 @@ mod tests {
         terminal.vt_write(b"\x1b[5n");
         drop(reader);
         assert_eq!(
-            forward_replies(&mut terminal, &writes)
+            forward_replies(&mut terminal, &writes, &shutdown)
                 .unwrap_err()
                 .to_string(),
             "terminal writer stopped",
@@ -1652,6 +1946,7 @@ mod tests {
 
     #[test]
     fn controller_backpressures_instead_of_disconnecting() {
+        let (_shutdown_tx, shutdown) = bounded(0);
         let (events_tx, events) = bounded(1);
         events_tx
             .send(StreamEvent::Output {
@@ -1672,6 +1967,7 @@ mod tests {
             let mut controller = Some("controller".to_string());
             let mut generation = 1;
             broadcast(
+                &shutdown,
                 &mut subscribers,
                 &mut controller,
                 &mut generation,
@@ -1697,6 +1993,7 @@ mod tests {
 
     #[test]
     fn slow_observer_is_disconnected() {
+        let (_shutdown_tx, shutdown) = bounded(0);
         let (events_tx, _events) = bounded(1);
         events_tx
             .send(StreamEvent::Output {
@@ -1715,6 +2012,7 @@ mod tests {
         )]);
 
         broadcast(
+            &shutdown,
             &mut subscribers,
             &mut None,
             &mut 0,
@@ -1730,6 +2028,7 @@ mod tests {
 
     #[test]
     fn output_is_batched_without_reordering_other_messages() {
+        let (_shutdown_tx, shutdown) = bounded(0);
         let (messages_tx, messages) = bounded(4);
         messages_tx
             .send(ActorMessage::Output(b"abc".to_vec()))
@@ -1737,16 +2036,16 @@ mod tests {
         messages_tx
             .send(ActorMessage::Output(b"def".to_vec()))
             .unwrap();
-        messages_tx.send(ActorMessage::Shutdown).unwrap();
+        messages_tx.send(ActorMessage::ReaderEof).unwrap();
         let mut pending = None;
 
         assert!(matches!(
-            receive_actor_message(&messages, &mut pending).unwrap(),
+            receive_actor_message(&messages, &mut pending, &shutdown).unwrap(),
             ActorMessage::Output(bytes) if bytes == b"abcdef"
         ));
         assert!(matches!(
-            receive_actor_message(&messages, &mut pending).unwrap(),
-            ActorMessage::Shutdown
+            receive_actor_message(&messages, &mut pending, &shutdown).unwrap(),
+            ActorMessage::ReaderEof
         ));
     }
 }
