@@ -1,6 +1,7 @@
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
@@ -13,8 +14,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileRenameInfoEx,
-    GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
-    SetFileInformationByHandle, WRITE_DAC,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
@@ -103,7 +104,7 @@ impl Runtime {
         )?;
         check_kind(&directory_handle, true)?;
         security.make_private(directory_handle.as_raw_handle())?;
-        let directory = fs::canonicalize(&directory)?;
+        let directory = held_directory_path(&directory_handle)?;
         let lock = open(
             &directory.join(LOCK_FILE),
             GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
@@ -163,7 +164,14 @@ fn write_registration(
 }
 
 fn publish(file: &File, directory: &File) -> Result<()> {
-    let name = REGISTRATION_FILE.encode_utf16().collect::<Vec<_>>();
+    // The Win32 wrapper rejects a non-null RootDirectory, unlike the native
+    // NtSetInformationFile interface. Resolve the full destination from the held
+    // directory handle, never from the unvalidated environment path.
+    let name = held_directory_path(directory)?
+        .join(REGISTRATION_FILE)
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
     let name_bytes = u32::try_from(size_of_val(name.as_slice()))?;
     let bytes = size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes as usize)
@@ -184,7 +192,7 @@ fn publish(file: &File, directory: &File) -> Result<()> {
         (&raw mut (*info).Anonymous).write(FILE_RENAME_INFO_0 {
             Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
         });
-        (&raw mut (*info).RootDirectory).write(directory.as_raw_handle());
+        (&raw mut (*info).RootDirectory).write(null_mut());
         (&raw mut (*info).FileNameLength).write(name_bytes);
         let destination = allocation
             .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName))
@@ -192,8 +200,8 @@ fn publish(file: &File, directory: &File) -> Result<()> {
         std::ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
         // Unlike ordinary MoveFileEx replacement, POSIX semantics preserve old
         // reader handles while new opens see the new file, with no missing-name
-        // interval. Source and destination directory stay held throughout; no
-        // path reopen or inherited ACL/metadata merge is involved.
+        // interval. Source and destination directory stay held throughout; the
+        // source is never reopened and no inherited ACL/metadata merge occurs.
         if SetFileInformationByHandle(
             file.as_raw_handle(),
             FileRenameInfoEx,
@@ -206,6 +214,28 @@ fn publish(file: &File, directory: &File) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn held_directory_path(directory: &File) -> Result<PathBuf> {
+    // SAFETY: query the normalized DOS path length for a live directory handle.
+    let length = unsafe { GetFinalPathNameByHandleW(directory.as_raw_handle(), null_mut(), 0, 0) };
+    if length == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut path = vec![0_u16; length as usize];
+    // SAFETY: the buffer has the requested length and the directory stays held.
+    let written = unsafe {
+        GetFinalPathNameByHandleW(directory.as_raw_handle(), path.as_mut_ptr(), length, 0)
+    };
+    if written == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if written >= length {
+        bail!("PTY runtime directory path changed during publication");
+    }
+    Ok(PathBuf::from(OsString::from_wide(
+        &path[..written as usize],
+    )))
 }
 
 pub(super) fn cleanup(registration: &Registration) -> Result<()> {
