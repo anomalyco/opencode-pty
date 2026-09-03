@@ -31,6 +31,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub(crate) mod security;
+use super::retained::Retained;
 use security::PrivateSecurity;
 
 const BUFFER_BYTES: u32 = 64 * 1024;
@@ -348,7 +349,7 @@ impl DisconnectMonitor {
 
 struct Operation {
     pipe: Arc<Pipe>,
-    overlapped: Box<OVERLAPPED>,
+    overlapped: Retained<OVERLAPPED>,
     event: OwnedHandle,
     pending: bool,
 }
@@ -360,7 +361,7 @@ impl Operation {
             return Err(cancelled());
         }
         let event = event()?;
-        let overlapped = Box::new(OVERLAPPED {
+        let overlapped = Retained::new(OVERLAPPED {
             hEvent: event.as_raw_handle(),
             ..Default::default()
         });
@@ -377,7 +378,7 @@ impl Operation {
         submit: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
     ) -> io::Result<Option<u32>> {
         self.pending = true;
-        if submit(self.pipe.handle.as_raw_handle(), &mut *self.overlapped) != 0 {
+        if submit(self.pipe.handle.as_raw_handle(), self.overlapped.as_ptr()) != 0 {
             return self.poll();
         }
         let error = io::Error::last_os_error();
@@ -395,7 +396,7 @@ impl Operation {
         if unsafe {
             GetOverlappedResult(
                 self.pipe.handle.as_raw_handle(),
-                &*self.overlapped,
+                self.overlapped.as_ptr(),
                 &mut count,
                 0,
             )
@@ -447,11 +448,11 @@ impl Drop for Operation {
             // freeing the OVERLAPPED/event or returning the borrowed I/O buffer.
             // CancelIoEx alone does not guarantee the kernel has stopped using it.
             unsafe {
-                CancelIoEx(self.pipe.handle.as_raw_handle(), &*self.overlapped);
+                CancelIoEx(self.pipe.handle.as_raw_handle(), self.overlapped.as_ptr());
                 let mut count = 0;
                 GetOverlappedResult(
                     self.pipe.handle.as_raw_handle(),
-                    &*self.overlapped,
+                    self.overlapped.as_ptr(),
                     &mut count,
                     1,
                 );

@@ -50,6 +50,10 @@ The pipe is full-duplex and byte-mode, with overlapped reads/writes capped at
 64 KiB per kernel operation. Accept polling never waits for a client; connect
 retries are bounded to five seconds. Each pending operation is cancelled and its
 completion reaped before its buffers or event are freed.
+The kernel-retained `OVERLAPPED` allocation uses an owned raw pointer, not a
+retained borrow from a movable `Box`; it is reclaimed only after I/O completion.
+The allocation helper's move/repeated-access behavior is checked under both
+Miri borrow models alongside the callback ownership tests.
 
 Named pipes have no half-close. Protocol clients close after reading an ordinary
 response or the final subscription event. Completion retains queued bytes while
