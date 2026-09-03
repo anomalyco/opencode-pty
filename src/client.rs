@@ -12,13 +12,15 @@ use crate::protocol::{
     read_subscription_event, write_frame,
 };
 use crate::service::{CreateTerminal, TerminalId, TerminalInfo, TerminalRows};
+#[cfg(unix)]
+use crate::transport::Connection;
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct TerminalClient {
     registration: Registration,
     #[cfg(unix)]
-    owner: Option<(std::os::unix::net::UnixStream, std::process::Child)>,
+    owner: Option<(Connection, std::process::Child)>,
 }
 
 #[derive(Debug)]
@@ -41,7 +43,7 @@ pub struct RemoteReplay {
 
 #[cfg(unix)]
 pub struct TerminalSubscription {
-    stream: std::os::unix::net::UnixStream,
+    stream: Connection,
     pub terminal: TerminalInfo,
     pub role: AttachmentRole,
     pub generation: u64,
@@ -58,7 +60,6 @@ impl TerminalSubscription {
 impl TerminalClient {
     #[cfg(unix)]
     pub fn start() -> Result<Self> {
-        use std::os::unix::net::UnixStream;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
@@ -82,7 +83,7 @@ impl TerminalClient {
             if let Ok(registration) = read_registration()
                 && registration.pid == child.id()
             {
-                let mut stream = UnixStream::connect(&registration.socket)?;
+                let mut stream = Connection::connect(&registration.socket)?;
                 stream.set_read_timeout(Some(START_TIMEOUT))?;
                 stream.set_write_timeout(Some(START_TIMEOUT))?;
                 write_frame(
@@ -304,8 +305,7 @@ impl TerminalClient {
         role: AttachmentRole,
         takeover: bool,
     ) -> Result<TerminalSubscription> {
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(&self.registration.socket)?;
+        let mut stream = Connection::connect(&self.registration.socket)?;
         write_frame(
             &mut stream,
             &Envelope {
@@ -362,8 +362,7 @@ impl TerminalClient {
 
     #[cfg(unix)]
     fn request(&self, request: Request) -> Result<Response> {
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(&self.registration.socket).with_context(|| {
+        let mut stream = Connection::connect(&self.registration.socket).with_context(|| {
             format!(
                 "failed to connect to {}",
                 self.registration.socket.display()
