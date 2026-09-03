@@ -5,3 +5,5 @@ mod ghostty;
 mod ownership;
 pub mod protocol;
 pub mod service;
+#[cfg(unix)]
+mod transport;

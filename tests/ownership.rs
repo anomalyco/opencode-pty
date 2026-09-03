@@ -163,6 +163,21 @@ fn assert_terminal_stopped(terminal: &TerminalInfo) {
 #[test]
 fn owner_loss_stops_terminals_despite_blocked_clients() {
     let mut daemon = Daemon::start();
+    let mut unauthenticated = daemon.connect();
+    write_frame(
+        &mut unauthenticated,
+        &Envelope {
+            token: "wrong-token".into(),
+            request: Request::Own {
+                instance_id: daemon.registration.instance_id.clone(),
+                ticket: None,
+            },
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(read_frame(&mut unauthenticated).unwrap(), Response::Error { message } if message == "authentication failed")
+    );
     assert!(matches!(
         daemon.request(Request::Own {
             instance_id: "wrong-instance".into(),
@@ -195,6 +210,60 @@ fn owner_loss_stops_terminals_despite_blocked_clients() {
     drop(owner);
     daemon.wait();
     assert_terminal_stopped(&terminal);
+}
+
+#[test]
+fn subscription_delivers_final_exit_frame_before_closing() {
+    use opencode_pty::protocol::{SubscriptionEvent, read_subscription_event};
+
+    let mut daemon = Daemon::start();
+    let (owner, response) = daemon.own(None);
+    assert!(matches!(response, Response::Owned));
+    let terminal = daemon.terminal("read line; printf final-output");
+    let mut subscription = daemon.connect();
+    assert!(matches!(
+        daemon.send(
+            &mut subscription,
+            Request::Subscribe {
+                id: terminal.id,
+                offset: 0,
+                attachment_id: "final-observer".into(),
+                role: AttachmentRole::Observer,
+                takeover: false,
+            }
+        ),
+        Response::Attached { .. }
+    ));
+    assert!(matches!(
+        daemon.request(Request::Write {
+            id: terminal.id,
+            attachment_id: None,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(b"finish\n"),
+        }),
+        Response::Ok
+    ));
+    let mut output = Vec::new();
+    loop {
+        match read_subscription_event(&mut subscription).unwrap() {
+            SubscriptionEvent::Output { bytes, .. } => output.extend(bytes),
+            SubscriptionEvent::Response(response) => match *response {
+                Response::Exited {
+                    exit_code,
+                    final_offset,
+                } => {
+                    assert_eq!(exit_code, Some(0));
+                    assert_eq!(final_offset, output.len() as u64);
+                    break;
+                }
+                Response::Error { message } => panic!("subscription error: {message}"),
+                _ => {}
+            },
+        }
+    }
+    assert!(String::from_utf8_lossy(&output).contains("final-output"));
+    drop(subscription);
+    drop(owner);
+    daemon.wait();
 }
 
 #[test]

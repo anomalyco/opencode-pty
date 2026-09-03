@@ -30,6 +30,26 @@ consumes the ticket. Expiry stops an unowned daemon; if the old owner is still
 connected, expiry simply cancels the handoff. `shutdown` always stops the daemon,
 including during handoff. No ownership or handoff state is persisted.
 
+### Local transport boundary
+
+`src/transport/` owns endpoint listening/connecting, byte-stream I/O,
+disconnect monitoring, response completion, and cancellation. Authentication,
+protocol framing, dispatch, subscriptions, and ownership stay shared in the
+daemon; runtime-directory/registration wiring is platform-specific. The Unix
+backend preserves half-close when completing subscriptions so queued final
+frames are not discarded on macOS. Shutdown cancellation is a separate operation
+that wakes partial requests and blocked subscription writes before joining.
+
+The planned Windows backend keeps protocol 7 and the registration fields
+`instance_id`, `pid`, `protocol`, `socket`, and `token`. Treat `socket` as an opaque
+local endpoint: on Windows it will be `\\.\pipe\opencode-pty-<instance_id>`, not a
+filesystem socket. A random per-instance name, exclusive first pipe instance,
+current-user access control, and rejection of remote clients protect the endpoint;
+the private registration file remains the discovery and authentication source.
+Named-pipe completion will use explicit bounded, cancellable delivery rather than
+pretending to support Unix half-close. This boundary alone does not implement
+Windows transport or daemon support.
+
 ## Architecture
 
 ```text
