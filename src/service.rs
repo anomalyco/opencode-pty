@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::ghostty::{Format, Terminal, TerminalOptions};
 use crate::protocol::AttachmentRole;
 
+#[cfg(windows)]
+mod windows;
+
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 30;
 const REPLAY_CAPACITY: usize = 2 * 1024 * 1024;
@@ -427,7 +430,7 @@ impl TerminalHandle {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
 
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(command)
             .with_context(|| format!("failed to spawn {}", request.program))?;
@@ -465,6 +468,8 @@ impl TerminalHandle {
         // Disconnecting this channel wakes every cancellable queue operation,
         // even when the actor cannot consume an ordinary shutdown message.
         let (shutdown_tx, shutdown) = bounded(0);
+        #[cfg(windows)]
+        let (close_tx, close_rx) = bounded(1);
         let (init_tx, init_rx) = std_mpsc::sync_channel(1);
 
         let actor_info = Arc::clone(&info);
@@ -474,7 +479,11 @@ impl TerminalHandle {
             .name(format!("opencode-pty-actor-{id}"))
             .spawn(move || {
                 let result = run_actor(ActorConfig {
-                    master: pair.master,
+                    master: ActorMaster {
+                        pty: Some(pair.master),
+                        #[cfg(windows)]
+                        close_tx,
+                    },
                     messages: actor_rx,
                     writes: actor_writer_tx,
                     shutdown: actor_shutdown,
@@ -555,10 +564,16 @@ impl TerminalHandle {
         let wait_thread = thread::Builder::new()
             .name(format!("opencode-pty-wait-{id}"))
             .spawn(move || {
-                let result = child.wait().map(|status| Some(status.exit_code()));
-                let _ = wait_actor_tx.send(ActorMessage::ChildExited(
-                    result.map_err(|error| error.to_string()),
-                ));
+                #[cfg(windows)]
+                windows::wait_and_close(child, wait_actor_tx, close_rx);
+                #[cfg(unix)]
+                {
+                    let mut child = child;
+                    let result = child.wait().map(|status| Some(status.exit_code()));
+                    let _ = wait_actor_tx.send(ActorMessage::ChildExited(
+                        result.map_err(|error| error.to_string()),
+                    ));
+                }
             })
             .context("failed to spawn terminal child waiter")?;
 
@@ -684,8 +699,38 @@ enum WriterMessage {
     Bytes(Vec<u8>),
 }
 
+struct ActorMaster {
+    pty: Option<Box<dyn MasterPty + Send>>,
+    #[cfg(windows)]
+    close_tx: Sender<Box<dyn MasterPty + Send>>,
+}
+
+impl ActorMaster {
+    fn get(&self) -> Result<&(dyn MasterPty + Send)> {
+        self.pty
+            .as_deref()
+            .ok_or_else(|| anyhow!("terminal child has exited"))
+    }
+
+    #[cfg(windows)]
+    fn close(&mut self) {
+        if let Some(master) = self.pty.take() {
+            // A capacity-one channel receives this unique master exactly once;
+            // handoff cannot wait on ClosePseudoConsole or PTY output drainage.
+            let _ = self.close_tx.send(master);
+        }
+    }
+}
+
+impl Drop for ActorMaster {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        self.close();
+    }
+}
+
 struct ActorConfig {
-    master: Box<dyn MasterPty + Send>,
+    master: ActorMaster,
     messages: Receiver<ActorMessage>,
     writes: Sender<WriterMessage>,
     shutdown: Receiver<()>,
@@ -708,6 +753,8 @@ fn run_actor(config: ActorConfig) -> Result<()> {
         rows,
         init_tx,
     } = config;
+    #[cfg(windows)]
+    let mut master = master;
     let mut terminal = Terminal::new(TerminalOptions {
         cols,
         rows,
@@ -727,14 +774,16 @@ fn run_actor(config: ActorConfig) -> Result<()> {
     let result = loop {
         match receive_actor_message(&messages, &mut pending_message, &shutdown) {
             Ok(ActorMessage::RefreshForegroundProcess { reply }) => {
-                publish_foreground_process(
-                    &shutdown,
-                    &*master,
-                    &info,
-                    &mut subscribers,
-                    &mut controller,
-                    &mut controller_generation,
-                );
+                if let Ok(master) = master.get() {
+                    publish_foreground_process(
+                        &shutdown,
+                        master,
+                        &info,
+                        &mut subscribers,
+                        &mut controller,
+                        &mut controller_generation,
+                    );
+                }
                 let _ = reply.send(Ok(()));
             }
             Ok(ActorMessage::Output(bytes)) => {
@@ -778,8 +827,12 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                 bytes,
                 reply,
             }) => {
-                let result = authorize_controller(&controller, attachment_id.as_deref())
-                    .and_then(|_| queue_write(&writes, &shutdown, bytes));
+                let result =
+                    authorize_controller(&controller, attachment_id.as_deref()).and_then(|_| {
+                        #[cfg(windows)]
+                        master.get()?;
+                        queue_write(&writes, &shutdown, bytes)
+                    });
                 let _ = reply.send(result);
             }
             Ok(ActorMessage::Resize {
@@ -790,7 +843,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             }) => {
                 let result = (|| {
                     authorize_controller(&controller, attachment_id.as_deref())?;
-                    master.resize(PtySize {
+                    master.get()?.resize(PtySize {
                         rows,
                         cols,
                         pixel_width: 0,
@@ -861,7 +914,7 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         .map(|value| value.cols != cols || value.rows != rows)
                         .unwrap_or(true);
                     if changed {
-                        master.resize(PtySize {
+                        master.get()?.resize(PtySize {
                             rows,
                             cols,
                             pixel_width: 0,
@@ -890,6 +943,8 @@ fn run_actor(config: ActorConfig) -> Result<()> {
                         );
                     }
                     if let Some(bytes) = bytes {
+                        #[cfg(windows)]
+                        master.get()?;
                         queue_write(&writes, &shutdown, bytes)?;
                     }
                     Ok(())
@@ -997,9 +1052,16 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             }
             Ok(ActorMessage::ChildExited(result)) => {
                 child_exit = Some(result);
+                // ConPTY keeps its output pipe open until HPCON is closed.
+                // The wait worker closes it while this actor and the reader
+                // keep processing output, including the real final EOF.
+                #[cfg(windows)]
+                master.close();
             }
             Ok(ActorMessage::ReaderFailed(message)) | Ok(ActorMessage::WriterFailed(message)) => {
-                if let Ok(mut value) = info.write() {
+                // Closing ConPTY can finish a pending write with BrokenPipe
+                // after the final exit event. Never overwrite a published exit.
+                if !exit_published && let Ok(mut value) = info.write() {
                     value.lifecycle = TerminalLifecycle::Failed { message };
                 }
             }
@@ -1518,6 +1580,14 @@ mod tests {
         let (actor_tx, messages) = bounded(ACTOR_QUEUE_CAPACITY);
         let (writes, writer_rx) = bounded(1);
         let (shutdown_tx, shutdown) = bounded(0);
+        #[cfg(windows)]
+        let (close_tx, close_rx) = bounded(1);
+        #[cfg(windows)]
+        let closer = thread::spawn(move || {
+            if let Ok(master) = close_rx.recv() {
+                drop(master);
+            }
+        });
         let (init_tx, init_rx) = std_mpsc::sync_channel(1);
         let info = Arc::new(RwLock::new(TerminalInfo {
             id: 1,
@@ -1536,7 +1606,11 @@ mod tests {
         let actor_info = Arc::clone(&info);
         let actor = thread::spawn(move || {
             run_actor(ActorConfig {
-                master: Box::new(TestMaster),
+                master: ActorMaster {
+                    pty: Some(Box::new(TestMaster)),
+                    #[cfg(windows)]
+                    close_tx,
+                },
                 messages,
                 writes,
                 shutdown,
@@ -1555,7 +1629,11 @@ mod tests {
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
                 killer: Mutex::new(Box::new(TestKiller)),
                 info,
-                joins: Mutex::new(Some(vec![actor])),
+                joins: Mutex::new(Some(vec![
+                    actor,
+                    #[cfg(windows)]
+                    closer,
+                ])),
             },
             writer_rx,
         )
@@ -1603,6 +1681,14 @@ mod tests {
             if !eof_first {
                 assert_eq!(snapshot.text, "final");
             }
+            actor
+                .actor_tx
+                .send(ActorMessage::WriterFailed("late broken pipe".into()))
+                .unwrap();
+            let after_write_error = actor
+                .request(|reply| ActorMessage::Snapshot { reply })
+                .unwrap();
+            assert_eq!(after_write_error.info.lifecycle, snapshot.info.lifecycle);
             actor.shutdown().unwrap();
             actor.shutdown().unwrap();
         }
