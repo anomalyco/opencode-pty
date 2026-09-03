@@ -35,6 +35,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
