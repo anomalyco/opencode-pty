@@ -9,11 +9,15 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileRenameInfoEx,
+    GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
+    SetFileInformationByHandle, WRITE_DAC,
+};
+use windows_sys::Win32::System::WindowsProgramming::{
+    FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
 };
 
 use super::{LOCK_FILE, REGISTRATION_FILE, Registration};
@@ -92,7 +96,7 @@ impl Runtime {
         // replaced out from under the running daemon.
         let directory_handle = open(
             &directory,
-            GENERIC_READ | READ_CONTROL | WRITE_DAC,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC,
             OPEN_EXISTING,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             &security,
@@ -121,7 +125,7 @@ impl Runtime {
             token: format!("{:032x}", rand::random::<u128>()),
         };
         let listener = Listener::bind(&registration.socket)?;
-        write_registration(&directory, &registration, &security)?;
+        write_registration(&directory, &directory_handle, &registration, &security)?;
         Ok((
             Self {
                 registration,
@@ -135,6 +139,7 @@ impl Runtime {
 
 fn write_registration(
     directory: &Path,
+    directory_handle: &File,
     registration: &Registration,
     security: &PrivateSecurity,
 ) -> Result<()> {
@@ -142,34 +147,65 @@ fn write_registration(
     let result = (|| -> Result<()> {
         let mut file = open(
             &temporary,
-            GENERIC_WRITE | READ_CONTROL,
+            GENERIC_WRITE | READ_CONTROL | DELETE,
             CREATE_NEW,
             0,
             security,
         )?;
         file.write_all(&serde_json::to_vec_pretty(registration)?)?;
         file.sync_all()?;
-        drop(file);
-        let from = wide_path(&temporary)?;
-        let to = wide_path(&directory.join(REGISTRATION_FILE))?;
-        // SAFETY: both paths are NUL-terminated; replacement stays in the held
-        // private directory. Readers allow delete sharing for atomic replacement.
-        if unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
+        publish(&file, directory_handle)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+fn publish(file: &File, directory: &File) -> Result<()> {
+    let name = REGISTRATION_FILE.encode_utf16().collect::<Vec<_>>();
+    let name_bytes = u32::try_from(size_of_val(name.as_slice()))?;
+    let bytes = size_of::<FILE_RENAME_INFO>()
+        .checked_add(name_bytes as usize)
+        .context("registration rename buffer overflow")?;
+    let buffer_bytes = u32::try_from(bytes)?;
+    // FILE_RENAME_INFO has a variable-length trailing UTF-16 name. usize gives
+    // this buffer the struct's alignment on both supported 64-bit architectures.
+    const {
+        assert!(align_of::<FILE_RENAME_INFO>() <= align_of::<usize>());
+    }
+    let mut buffer = vec![0_usize; bytes.div_ceil(size_of::<usize>())];
+    let allocation = buffer.as_mut_ptr().cast::<u8>();
+    let info = allocation.cast::<FILE_RENAME_INFO>();
+    // SAFETY: the zeroed, aligned allocation covers the header and complete name.
+    // Use raw pointers into the whole allocation, not a borrow of FileName[1]
+    // whose extent is smaller than the variable-sized trailing data.
+    unsafe {
+        (&raw mut (*info).Anonymous).write(FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        });
+        (&raw mut (*info).RootDirectory).write(directory.as_raw_handle());
+        (&raw mut (*info).FileNameLength).write(name_bytes);
+        let destination = allocation
+            .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName))
+            .cast::<u16>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
+        // Unlike ordinary MoveFileEx replacement, POSIX semantics preserve old
+        // reader handles while new opens see the new file, with no missing-name
+        // interval. Source and destination directory stay held throughout; no
+        // path reopen or inherited ACL/metadata merge is involved.
+        if SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileRenameInfoEx,
+            info.cast(),
+            buffer_bytes,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to atomically publish PTY registration");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn cleanup(registration: &Registration) -> Result<()> {
@@ -242,6 +278,14 @@ mod tests {
             std::env::temp_dir().join(format!("pty-registration-{:032x}", rand::random::<u128>()));
         fs::create_dir(&directory).unwrap();
         let security = PrivateSecurity::new().unwrap();
+        let directory_handle = open(
+            &directory,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            OPEN_EXISTING,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &security,
+        )
+        .unwrap();
         let mut registration = Registration {
             instance_id: "first".into(),
             pid: 1,
@@ -249,7 +293,7 @@ mod tests {
             socket: PathBuf::from(r"\\.\pipe\opencode-pty-first"),
             token: "secret".into(),
         };
-        write_registration(&directory, &registration, &security).unwrap();
+        write_registration(&directory, &directory_handle, &registration, &security).unwrap();
         let path = directory.join(REGISTRATION_FILE);
         let mut old_reader = open(
             &path,
@@ -261,7 +305,7 @@ mod tests {
         .unwrap();
         security.check_private(old_reader.as_raw_handle()).unwrap();
         registration.instance_id = "second".into();
-        write_registration(&directory, &registration, &security).unwrap();
+        write_registration(&directory, &directory_handle, &registration, &security).unwrap();
         assert_eq!(read_registration_at(&path).unwrap().instance_id, "second");
         let mut old = String::new();
         old_reader.read_to_string(&mut old).unwrap();
@@ -272,6 +316,7 @@ mod tests {
             "first"
         );
         drop(old_reader);
+        drop(directory_handle);
         fs::remove_dir_all(directory).unwrap();
     }
 }
