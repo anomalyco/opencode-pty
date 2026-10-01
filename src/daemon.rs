@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const REGISTRATION_FILE: &str = "service.json";
@@ -12,6 +13,52 @@ pub struct Registration {
     pub protocol: u32,
     pub socket: PathBuf,
     pub token: String,
+}
+
+/// Shared parent of runtime directories, inside OpenCode's state directory.
+/// Registration files must not live in temporary directories, which macOS purges
+/// while daemons run.
+pub fn default_runtime_root() -> PathBuf {
+    resolve_runtime_root(
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::home_dir(),
+    )
+}
+
+fn resolve_runtime_root(state: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    state
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| home.join(".local").join("state")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("opencode")
+        .join("pty")
+}
+
+/// Resolves `<root>/<name>`, where the name is a single plain path component.
+pub fn runtime_dir(root: Option<&Path>, name: &str) -> Result<PathBuf> {
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !valid {
+        bail!("invalid runtime name {name:?}; use letters, digits, '.', '_', or '-'");
+    }
+    Ok(root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_runtime_root)
+        .join(name))
+}
+
+pub fn registration_path(directory: &Path) -> PathBuf {
+    directory.join(REGISTRATION_FILE)
+}
+
+pub fn read_registration(directory: &Path) -> Result<Registration> {
+    let data = std::fs::read(registration_path(directory))
+        .context("opencode-pty registration is unavailable")?;
+    serde_json::from_slice(&data).context("invalid opencode-pty registration")
 }
 
 #[cfg(unix)]
@@ -32,7 +79,7 @@ mod unix {
     use fs2::FileExt;
     use sha2::{Digest, Sha256};
 
-    use super::{LOCK_FILE, REGISTRATION_FILE, Registration};
+    use super::{LOCK_FILE, REGISTRATION_FILE, Registration, read_registration, registration_path};
     use crate::ownership::Ownership;
     use crate::protocol::{
         Envelope, PROTOCOL_VERSION, Request, Response, read_frame, write_frame, write_output_frame,
@@ -41,44 +88,8 @@ mod unix {
 
     const STALE_RUNTIME_AGE: Duration = Duration::from_secs(10 * 60);
 
-    pub fn service_dir() -> PathBuf {
-        if let Some(path) = std::env::var_os("OPENCODE_PTY_RUNTIME_DIR") {
-            return PathBuf::from(path);
-        }
-        runtime_root()
-    }
-
-    /// Shared parent of per-server runtime directories, inside OpenCode's state
-    /// directory. Registration files must not live in temporary directories,
-    /// which macOS purges while daemons run.
-    pub fn runtime_root() -> PathBuf {
-        resolve_runtime_root(
-            std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-            std::env::home_dir(),
-        )
-    }
-
-    fn resolve_runtime_root(state: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
-        state
-            .filter(|path| path.is_absolute())
-            .or_else(|| home.map(|home| home.join(".local").join("state")))
-            .unwrap_or_else(std::env::temp_dir)
-            .join("opencode")
-            .join("pty")
-    }
-
-    pub fn registration_path() -> PathBuf {
-        service_dir().join(REGISTRATION_FILE)
-    }
-
-    pub fn read_registration() -> Result<Registration> {
-        let data =
-            fs::read(registration_path()).context("opencode-pty registration is unavailable")?;
-        serde_json::from_slice(&data).context("invalid opencode-pty registration")
-    }
-
-    pub fn run() -> Result<()> {
-        let directory = service_dir();
+    pub fn run(directory: &Path) -> Result<()> {
+        let directory = directory.to_path_buf();
         fs::create_dir_all(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         let lock_path = directory.join(LOCK_FILE);
@@ -166,12 +177,13 @@ mod unix {
         }
         let (cleanup_tx, cleanup_rx) = crossbeam_channel::bounded::<()>(1);
         let cleanup_registration = registration.clone();
+        let cleanup_registration_directory = directory.clone();
         let cleanup_socket = socket.clone();
         let cleanup_directory = directory.clone();
         let watchdog = thread::spawn(move || {
             if cleanup_rx.recv_timeout(Duration::from_secs(5)).is_err() {
                 eprintln!("opencode-pty cleanup timed out; forcing exit");
-                let _ = remove_if_current(&cleanup_registration);
+                let _ = remove_if_current(&cleanup_registration_directory, &cleanup_registration);
                 cleanup_socket.remove_if_current();
                 remove_runtime_directory(&cleanup_directory);
                 std::process::exit(1);
@@ -183,7 +195,7 @@ mod unix {
         }
         let _ = sweeper.join();
         drop(service);
-        let result = remove_if_current(&registration);
+        let result = remove_if_current(&directory, &registration);
         socket.remove_if_current();
         // The lock is still held, so no successor can be using this directory.
         remove_runtime_directory(&directory);
@@ -230,11 +242,7 @@ mod unix {
         let Some(parent) = directory.parent() else {
             return;
         };
-        // Only sweep the shared root; explicit runtime directories may live anywhere.
         let same = |left: &Path, right: &Path| matches!((fs::canonicalize(left), fs::canonicalize(right)), (Ok(left), Ok(right)) if left == right);
-        if !same(parent, &runtime_root()) {
-            return;
-        }
         let Ok(entries) = fs::read_dir(parent) else {
             return;
         };
@@ -750,14 +758,15 @@ mod unix {
         use std::io::Write;
         file.write_all(&data)?;
         file.sync_all()?;
-        fs::rename(&temporary, registration_path())?;
+        fs::rename(&temporary, registration_path(directory))?;
         Ok(())
     }
 
-    fn remove_if_current(registration: &Registration) -> Result<()> {
-        if read_registration().is_ok_and(|current| current.instance_id == registration.instance_id)
+    fn remove_if_current(directory: &Path, registration: &Registration) -> Result<()> {
+        if read_registration(directory)
+            .is_ok_and(|current| current.instance_id == registration.instance_id)
         {
-            fs::remove_file(registration_path())?;
+            fs::remove_file(registration_path(directory))?;
         }
         Ok(())
     }
@@ -793,17 +802,32 @@ mod unix {
         fn runtime_root_avoids_temporary_directories() {
             let home = Some(PathBuf::from("/home/user"));
             assert_eq!(
-                resolve_runtime_root(Some("/state".into()), home.clone()),
+                super::super::resolve_runtime_root(Some("/state".into()), home.clone()),
                 PathBuf::from("/state/opencode/pty")
             );
             assert_eq!(
-                resolve_runtime_root(Some("relative".into()), home.clone()),
+                super::super::resolve_runtime_root(Some("relative".into()), home.clone()),
                 PathBuf::from("/home/user/.local/state/opencode/pty")
             );
             assert_eq!(
-                resolve_runtime_root(None, home),
+                super::super::resolve_runtime_root(None, home),
                 PathBuf::from("/home/user/.local/state/opencode/pty")
             );
+        }
+
+        #[test]
+        fn runtime_names_are_single_components() {
+            let root = Path::new("/state");
+            assert_eq!(
+                super::super::runtime_dir(Some(root), "ee7511b8-7db0.x_1").unwrap(),
+                root.join("ee7511b8-7db0.x_1")
+            );
+            for name in ["", ".", "..", "a/b", "../x", "with space"] {
+                assert!(
+                    super::super::runtime_dir(Some(root), name).is_err(),
+                    "{name:?}"
+                );
+            }
         }
 
         struct Root(PathBuf);
@@ -908,19 +932,9 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{read_registration, registration_path, run, service_dir};
+pub use unix::run;
 
 #[cfg(not(unix))]
-pub fn run() -> anyhow::Result<()> {
+pub fn run(_directory: &Path) -> Result<()> {
     anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
-}
-
-#[cfg(not(unix))]
-pub fn read_registration() -> anyhow::Result<Registration> {
-    anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
-}
-
-#[cfg(not(unix))]
-pub fn registration_path() -> PathBuf {
-    PathBuf::from("opencode-pty-service.json")
 }

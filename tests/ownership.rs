@@ -17,19 +17,21 @@ use opencode_pty::service::TerminalInfo;
 
 struct Daemon {
     child: Child,
+    root: PathBuf,
     directory: PathBuf,
     registration: Registration,
 }
 
 impl Daemon {
     fn start() -> Self {
-        let directory = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "opencode-pty-ownership-{:032x}",
             rand::random::<u128>()
         ));
+        let directory = root.join("test");
         let mut child = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
-            .arg("daemon")
-            .env("OPENCODE_PTY_RUNTIME_DIR", &directory)
+            .args(["daemon", "--name", "test", "--runtime-dir"])
+            .arg(&root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .spawn()
@@ -53,6 +55,7 @@ impl Daemon {
         assert_eq!(registration.protocol, 7);
         Self {
             child,
+            root,
             directory,
             registration,
         }
@@ -155,7 +158,7 @@ impl Drop for Daemon {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.directory);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

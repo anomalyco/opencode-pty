@@ -12,7 +12,7 @@ that connection until exit; exiting the playground stops the daemon and all its
 terminals. Observer commands connect to an existing daemon without taking ownership.
 The service uses a private authenticated Unix socket and atomic registration file.
 
-Integrations launch `opencode-pty daemon` (protocol 7).
+Integrations launch `opencode-pty daemon --name NAME [--runtime-dir DIR]` (protocol 7).
 The server must claim the daemon within 5 seconds by sending the authenticated
 framed envelope `{"token":"...","request":{"op":"own","instance_id":"..."}}`.
 The response is `{"type":"owned"}`; that connection stays open as the sole
@@ -33,9 +33,11 @@ cancels the handoff. An ordinary authenticated `shutdown` request, or one from t
 current owner, stops the daemon even during handoff. No ownership or handoff state
 is persisted.
 
-The registration (`service.json`) and lock (`service.lock`) live in
-`OPENCODE_PTY_RUNTIME_DIR`, defaulting to OpenCode's state directory,
-`${XDG_STATE_HOME:-~/.local/state}/opencode/pty`. They never
+Every command requires `--name NAME`, which selects the runtime directory
+`DIR/NAME`. `--runtime-dir DIR` is optional and defaults to OpenCode's state
+directory, `${XDG_STATE_HOME:-~/.local/state}/opencode/pty`. Names are a single
+path component of letters, digits, `.`, `_`, or `-`. The registration
+(`service.json`) and lock (`service.lock`) live in that directory. They never
 default to a temporary directory, because macOS deletes unaccessed regular files
 there after three days. The socket stays under `/tmp/opencode-pty-<uid>/` to fit
 socket path limits; temporary cleaners skip sockets. A stopping daemon removes
@@ -76,15 +78,16 @@ user input without blocking inside the callback.
 ## Playground
 
 ```sh
-cargo run -- play
+cargo run -- play --name play
 ```
 
 Other service commands:
 
 ```sh
-cargo run -- status
-cargo run -- list
-cargo run -- stop  # destructive: terminates every terminal
+cargo run -- status --name play
+cargo run -- list --name play
+cargo run -- watch 1 --name play
+cargo run -- stop --name play  # destructive: terminates every terminal
 ```
 
 `play` starts and owns a new daemon; it cannot adopt an already running daemon.
@@ -155,7 +158,7 @@ libclang and do not depend on a third-party Ghostty Rust crate.
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-printf 'demo\nlist\nquit\n' | cargo run -- play
+printf 'demo\nlist\nquit\n' | cargo run -- play --name play
 ```
 
 ### Direct Ghostty bindings

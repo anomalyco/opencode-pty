@@ -1,12 +1,13 @@
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn runtime_dir(name: &str) -> PathBuf {
+fn runtime_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "opencode-pty-test-{name}-{}-{}",
         std::process::id(),
@@ -15,6 +16,15 @@ fn runtime_dir(name: &str) -> PathBuf {
             .expect("clock")
             .as_nanos()
     ))
+}
+
+fn target(root: &Path) -> [&OsStr; 4] {
+    [
+        OsStr::new("--name"),
+        OsStr::new("play"),
+        OsStr::new("--runtime-dir"),
+        root.as_os_str(),
+    ]
 }
 
 fn output_with_timeout(mut child: std::process::Child) -> std::process::Output {
@@ -58,10 +68,11 @@ fn read_created_terminal(child: &mut std::process::Child) -> String {
 
 #[test]
 fn playground_proves_authoritative_query_response() {
-    let runtime = runtime_dir("query");
+    let root = runtime_root("query");
+    let runtime = root.join("play");
     let mut child = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
-        .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+        .args(target(&root))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -75,6 +86,7 @@ fn playground_proves_authoritative_query_response() {
     let output = output_with_timeout(child);
     assert!(!runtime.join("service.json").exists());
     assert!(!runtime.exists(), "runtime directory was not removed");
+    std::fs::remove_dir_all(&root).unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -86,10 +98,11 @@ fn playground_proves_authoritative_query_response() {
 
 #[test]
 fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
-    let runtime = runtime_dir("ownership");
+    let root = runtime_root("ownership");
+    let runtime = root.join("play");
     let mut owner = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
-        .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+        .args(target(&root))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -115,7 +128,7 @@ fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
 
     let second = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
-        .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+        .args(target(&root))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -130,7 +143,7 @@ fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
         assert!(
             Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
                 .arg(command)
-                .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+                .args(target(&root))
                 .output()
                 .unwrap()
                 .status
@@ -152,7 +165,7 @@ fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
         assert!(
             !Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
                 .args(args)
-                .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+                .args(target(&root))
                 .output()
                 .unwrap()
                 .status
@@ -161,14 +174,16 @@ fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
         assert!(!runtime.join("service.json").exists());
     }
     assert!(!runtime.exists(), "runtime directory was not removed");
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
 fn observer_stream_replays_and_follows_until_exit() {
-    let runtime = runtime_dir("stream");
+    let root = runtime_root("stream");
+    let runtime = root.join("play");
     let mut owner = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .arg("play")
-        .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+        .args(target(&root))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -183,7 +198,7 @@ fn observer_stream_replays_and_follows_until_exit() {
 
     let watched = Command::new(env!("CARGO_BIN_EXE_opencode-pty"))
         .args(["watch", &terminal_id])
-        .env("OPENCODE_PTY_RUNTIME_DIR", &runtime)
+        .args(target(&root))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -193,6 +208,7 @@ fn observer_stream_replays_and_follows_until_exit() {
     assert!(output_with_timeout(owner).status.success());
     assert!(!runtime.join("service.json").exists());
     assert!(!runtime.exists(), "runtime directory was not removed");
+    std::fs::remove_dir_all(&root).unwrap();
     assert!(
         watched.status.success(),
         "watch failed with {:?}: {}",
