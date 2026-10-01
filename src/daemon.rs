@@ -48,29 +48,23 @@ mod unix {
         runtime_root()
     }
 
-    /// Shared parent of per-server runtime directories. Registration files must
-    /// not live in temporary directories, which macOS purges while daemons run.
+    /// Shared parent of per-server runtime directories, inside OpenCode's state
+    /// directory. Registration files must not live in temporary directories,
+    /// which macOS purges while daemons run.
     pub fn runtime_root() -> PathBuf {
         resolve_runtime_root(
-            std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
             std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
             std::env::home_dir(),
         )
     }
 
-    fn resolve_runtime_root(
-        runtime: Option<PathBuf>,
-        state: Option<PathBuf>,
-        home: Option<PathBuf>,
-    ) -> PathBuf {
-        if let Some(path) = runtime.filter(|path| path.is_absolute()) {
-            return path.join("opencode-pty");
-        }
-        let state = state
+    fn resolve_runtime_root(state: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+        state
             .filter(|path| path.is_absolute())
             .or_else(|| home.map(|home| home.join(".local").join("state")))
-            .unwrap_or_else(std::env::temp_dir);
-        state.join("opencode").join("pty")
+            .unwrap_or_else(std::env::temp_dir)
+            .join("opencode")
+            .join("pty")
     }
 
     pub fn registration_path() -> PathBuf {
@@ -799,23 +793,15 @@ mod unix {
         fn runtime_root_avoids_temporary_directories() {
             let home = Some(PathBuf::from("/home/user"));
             assert_eq!(
-                resolve_runtime_root(
-                    Some("/run/user/1".into()),
-                    Some("/state".into()),
-                    home.clone()
-                ),
-                PathBuf::from("/run/user/1/opencode-pty")
-            );
-            assert_eq!(
-                resolve_runtime_root(Some("relative".into()), Some("/state".into()), home.clone()),
+                resolve_runtime_root(Some("/state".into()), home.clone()),
                 PathBuf::from("/state/opencode/pty")
             );
             assert_eq!(
-                resolve_runtime_root(None, Some("relative".into()), home.clone()),
+                resolve_runtime_root(Some("relative".into()), home.clone()),
                 PathBuf::from("/home/user/.local/state/opencode/pty")
             );
             assert_eq!(
-                resolve_runtime_root(None, None, home),
+                resolve_runtime_root(None, home),
                 PathBuf::from("/home/user/.local/state/opencode/pty")
             );
         }

@@ -117,8 +117,8 @@ socket uses a fixed-length hash of the canonical runtime path
 under a private per-user `/tmp` directory to stay below platform path limits.
 
 `OPENCODE_PTY_RUNTIME_DIR` selects the runtime directory. Otherwise it is
-`$XDG_RUNTIME_DIR/opencode-pty`, then `$XDG_STATE_HOME/opencode/pty`, then
-`~/.local/state/opencode/pty`. Registration never defaults to a temporary
+OpenCode's state directory, `${XDG_STATE_HOME:-~/.local/state}/opencode/pty`.
+Registration never defaults to a temporary
 directory: macOS deletes regular files there that are unaccessed for three
 days, even while the daemon runs. Temporary cleaners skip sockets, so the
 socket stays in `/tmp`. On exit the daemon removes its registration and socket

@@ -34,8 +34,8 @@ current owner, stops the daemon even during handoff. No ownership or handoff sta
 is persisted.
 
 The registration (`service.json`) and lock (`service.lock`) live in
-`OPENCODE_PTY_RUNTIME_DIR`, defaulting to `$XDG_RUNTIME_DIR/opencode-pty`, then
-`$XDG_STATE_HOME/opencode/pty`, then `~/.local/state/opencode/pty`. They never
+`OPENCODE_PTY_RUNTIME_DIR`, defaulting to OpenCode's state directory,
+`${XDG_STATE_HOME:-~/.local/state}/opencode/pty`. They never
 default to a temporary directory, because macOS deletes unaccessed regular files
 there after three days. The socket stays under `/tmp/opencode-pty-<uid>/` to fit
 socket path limits; temporary cleaners skip sockets. A stopping daemon removes
