@@ -37,8 +37,8 @@ Every command requires `--name NAME`, which selects the runtime directory
 `DIR/NAME`. `--runtime-dir DIR` is optional and defaults to OpenCode's state
 directory, `${XDG_STATE_HOME:-~/.local/state}/opencode/pty`. Names are a single
 path component of letters, digits, `.`, `_`, or `-`. The registration
-(`service.json`) and lock (`service.lock`) live in that directory. They never
-default to a temporary directory, because macOS deletes unaccessed regular files
+(`service.json`) and lock (`service.lock`) live in that directory. They only
+default to a temporary directory when no home directory exists, because macOS deletes unaccessed regular files
 there after three days. The socket stays under `/tmp/opencode-pty-<uid>/` to fit
 socket path limits; temporary cleaners skip sockets. A stopping daemon removes
 its own files and runtime directory, and a starting daemon removes abandoned

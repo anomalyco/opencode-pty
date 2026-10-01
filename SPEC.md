@@ -100,8 +100,9 @@ terminals may die; live replacement of the daemon is not supported.
 Every daemon requires one authenticated owner connection within five seconds
 of startup. Owner loss stops the daemon unless a handoff was prepared on that
 connection. Handoff tickets expire 120 seconds after preparation and are
-consumed by successful replacement ownership. A connected owner cannot be
-displaced. The playground holds ownership until it exits; other CLI commands
+consumed by successful replacement ownership. A valid ticket replaces even a
+connected owner; the superseded connection can no longer prepare handoffs or
+stop the daemon, and its disconnect does not affect the new owner. The playground holds ownership until it exits; other CLI commands
 only observe or operate an existing daemon and never start one.
 
 Protocol v7 uses four-byte big-endian framing with bounded UTF-8 JSON control
@@ -119,8 +120,8 @@ under a private per-user `/tmp` directory to stay below platform path limits.
 Every command requires `--name NAME`; the runtime directory is `DIR/NAME`,
 where `--runtime-dir DIR` defaults to OpenCode's state directory,
 `${XDG_STATE_HOME:-~/.local/state}/opencode/pty`. A name is one path component
-of letters, digits, `.`, `_`, or `-`. Registration never defaults to a temporary
-directory: macOS deletes regular files there that are unaccessed for three
+of letters, digits, `.`, `_`, or `-`. Registration defaults to a temporary directory only when no home
+directory can be found: macOS deletes regular files there that are unaccessed for three
 days, even while the daemon runs. Temporary cleaners skip sockets, so the
 socket stays in `/tmp`. On exit the daemon removes its registration and socket
 only if they are still its own, then its empty runtime directory. At startup

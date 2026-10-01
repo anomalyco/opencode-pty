@@ -177,13 +177,12 @@ mod unix {
         }
         let (cleanup_tx, cleanup_rx) = crossbeam_channel::bounded::<()>(1);
         let cleanup_registration = registration.clone();
-        let cleanup_registration_directory = directory.clone();
         let cleanup_socket = socket.clone();
         let cleanup_directory = directory.clone();
         let watchdog = thread::spawn(move || {
             if cleanup_rx.recv_timeout(Duration::from_secs(5)).is_err() {
                 eprintln!("opencode-pty cleanup timed out; forcing exit");
-                let _ = remove_if_current(&cleanup_registration_directory, &cleanup_registration);
+                let _ = remove_if_current(&cleanup_directory, &cleanup_registration);
                 cleanup_socket.remove_if_current();
                 remove_runtime_directory(&cleanup_directory);
                 std::process::exit(1);
@@ -197,7 +196,8 @@ mod unix {
         drop(service);
         let result = remove_if_current(&directory, &registration);
         socket.remove_if_current();
-        // The lock is still held, so no successor can be using this directory.
+        // Remove the lock file before releasing it: a daemon that already opened it
+        // fails to lock it, and a later one creates a new lock file.
         remove_runtime_directory(&directory);
         let _ = cleanup_tx.send(());
         let _ = watchdog.join();
@@ -242,13 +242,12 @@ mod unix {
         let Some(parent) = directory.parent() else {
             return;
         };
-        let same = |left: &Path, right: &Path| matches!((fs::canonicalize(left), fs::canonicalize(right)), (Ok(left), Ok(right)) if left == right);
         let Ok(entries) = fs::read_dir(parent) else {
             return;
         };
         for entry in entries.flatten() {
             let candidate = entry.path();
-            if same(&candidate, directory) {
+            if same_path(&candidate, directory) {
                 continue;
             }
             if let Err(error) = sweep_runtime(&candidate, SystemTime::now()) {
@@ -258,6 +257,13 @@ mod unix {
                 );
             }
         }
+    }
+
+    fn same_path(left: &Path, right: &Path) -> bool {
+        matches!(
+            (fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
     }
 
     fn sweep_runtime(directory: &Path, now: SystemTime) -> Result<()> {
