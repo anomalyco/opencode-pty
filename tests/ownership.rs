@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Barrier;
@@ -114,12 +114,19 @@ impl Daemon {
     }
 
     fn wait(&mut self) {
+        self.exit();
+        assert!(!self.registration.socket.exists());
+    }
+
+    fn exit(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(7);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(status.success(), "daemon exit: {status}");
-                assert!(!self.directory.join("service.json").exists());
-                assert!(!self.registration.socket.exists());
+                assert!(
+                    !self.directory.exists(),
+                    "runtime directory was not removed"
+                );
                 return;
             }
             assert!(Instant::now() < deadline, "daemon did not stop");
@@ -347,4 +354,22 @@ fn unclaimed_daemon_times_out() {
     let mut daemon = Daemon::start();
     let _partial = daemon.connect();
     daemon.wait();
+}
+
+#[test]
+fn shutdown_keeps_a_replaced_socket() {
+    let mut daemon = Daemon::start();
+    let (mut owner, response) = daemon.own(None);
+    assert!(matches!(response, Response::Owned));
+    // A successor bound the same path; the exiting daemon must not unlink it.
+    std::fs::remove_file(&daemon.registration.socket).unwrap();
+    let replacement = UnixListener::bind(&daemon.registration.socket).unwrap();
+    assert!(matches!(
+        daemon.send(&mut owner, Request::Shutdown),
+        Response::Ok
+    ));
+    daemon.exit();
+    assert!(daemon.registration.socket.exists());
+    drop(replacement);
+    std::fs::remove_file(&daemon.registration.socket).unwrap();
 }

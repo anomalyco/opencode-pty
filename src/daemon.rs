@@ -19,9 +19,9 @@ mod unix {
     use std::fs::{self, OpenOptions};
     use std::net::Shutdown;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -39,15 +39,38 @@ mod unix {
     };
     use crate::service::{CreateTerminal, StreamEvent, TerminalService};
 
+    const STALE_RUNTIME_AGE: Duration = Duration::from_secs(10 * 60);
+
     pub fn service_dir() -> PathBuf {
         if let Some(path) = std::env::var_os("OPENCODE_PTY_RUNTIME_DIR") {
             return PathBuf::from(path);
         }
-        if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
-            return PathBuf::from(path).join("opencode-pty");
+        runtime_root()
+    }
+
+    /// Shared parent of per-server runtime directories. Registration files must
+    /// not live in temporary directories, which macOS purges while daemons run.
+    pub fn runtime_root() -> PathBuf {
+        resolve_runtime_root(
+            std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+            std::env::home_dir(),
+        )
+    }
+
+    fn resolve_runtime_root(
+        runtime: Option<PathBuf>,
+        state: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> PathBuf {
+        if let Some(path) = runtime.filter(|path| path.is_absolute()) {
+            return path.join("opencode-pty");
         }
-        let uid = nix::unistd::Uid::effective().as_raw();
-        std::env::temp_dir().join(format!("opencode-pty-{uid}"))
+        let state = state
+            .filter(|path| path.is_absolute())
+            .or_else(|| home.map(|home| home.join(".local").join("state")))
+            .unwrap_or_else(std::env::temp_dir);
+        state.join("opencode").join("pty")
     }
 
     pub fn registration_path() -> PathBuf {
@@ -81,16 +104,21 @@ mod unix {
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let socket = SocketFile::bound(socket_path)?;
 
         let registration = Registration {
             instance_id: random_id(),
             pid: std::process::id(),
             protocol: PROTOCOL_VERSION,
-            socket: socket_path.clone(),
+            socket: socket.path.clone(),
             token: random_id(),
         };
         let ownership = Arc::new(Mutex::new(Ownership::new(Instant::now())));
         write_registration(&directory, &registration)?;
+        let sweeper = {
+            let directory = directory.clone();
+            thread::spawn(move || sweep_stale_runtimes(&directory))
+        };
 
         let service = Arc::new(TerminalService::default());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -144,11 +172,14 @@ mod unix {
         }
         let (cleanup_tx, cleanup_rx) = crossbeam_channel::bounded::<()>(1);
         let cleanup_registration = registration.clone();
+        let cleanup_socket = socket.clone();
+        let cleanup_directory = directory.clone();
         let watchdog = thread::spawn(move || {
             if cleanup_rx.recv_timeout(Duration::from_secs(5)).is_err() {
                 eprintln!("opencode-pty cleanup timed out; forcing exit");
                 let _ = remove_if_current(&cleanup_registration);
-                let _ = fs::remove_file(&cleanup_registration.socket);
+                cleanup_socket.remove_if_current();
+                remove_runtime_directory(&cleanup_directory);
                 std::process::exit(1);
             }
         });
@@ -156,29 +187,166 @@ mod unix {
         for (_, handler) in handlers {
             let _ = handler.join();
         }
+        let _ = sweeper.join();
         drop(service);
-        remove_if_current(&registration)?;
-        let _ = fs::remove_file(&socket_path);
+        let result = remove_if_current(&registration);
+        socket.remove_if_current();
+        // The lock is still held, so no successor can be using this directory.
+        remove_runtime_directory(&directory);
         let _ = cleanup_tx.send(());
         let _ = watchdog.join();
         drop(lock);
+        result
+    }
+
+    /// The bound socket's inode, so cleanup never unlinks a successor's socket.
+    #[derive(Clone)]
+    struct SocketFile {
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+    }
+
+    impl SocketFile {
+        fn bound(path: PathBuf) -> Result<Self> {
+            let metadata = fs::symlink_metadata(&path)?;
+            Ok(Self {
+                path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+
+        fn remove_if_current(&self) {
+            if fs::symlink_metadata(&self.path)
+                .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+            {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    fn remove_runtime_directory(directory: &Path) {
+        let _ = fs::remove_file(directory.join(LOCK_FILE));
+        let _ = fs::remove_dir(directory);
+    }
+
+    /// Removes sibling runtime directories left by daemons that crashed.
+    fn sweep_stale_runtimes(directory: &Path) {
+        let Some(parent) = directory.parent() else {
+            return;
+        };
+        // Only sweep the shared root; explicit runtime directories may live anywhere.
+        let same = |left: &Path, right: &Path| matches!((fs::canonicalize(left), fs::canonicalize(right)), (Ok(left), Ok(right)) if left == right);
+        if !same(parent, &runtime_root()) {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if same(&candidate, directory) {
+                continue;
+            }
+            if let Err(error) = sweep_runtime(&candidate, SystemTime::now()) {
+                eprintln!(
+                    "opencode-pty could not remove stale runtime {}: {error:#}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+
+    fn sweep_runtime(directory: &Path, now: SystemTime) -> Result<()> {
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+        let age = now.duration_since(metadata.modified()?).unwrap_or_default();
+        if age < STALE_RUNTIME_AGE {
+            return Ok(());
+        }
+        let mut files = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let known = name == LOCK_FILE
+                || name == REGISTRATION_FILE
+                || (name.starts_with("service.") && name.ends_with(".tmp"));
+            if !known || !entry.file_type()?.is_file() {
+                // Not a runtime directory this daemon created.
+                return Ok(());
+            }
+            files.push(entry.path());
+        }
+
+        let lock_path = directory.join(LOCK_FILE);
+        let _lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(lock) => {
+                if lock.try_lock_exclusive().is_err() {
+                    return Ok(());
+                }
+                Some(lock)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let registration = fs::read(directory.join(REGISTRATION_FILE))
+                    .ok()
+                    .and_then(|data| serde_json::from_slice::<Registration>(&data).ok());
+                if registration.is_some_and(|registration| process_exists(registration.pid)) {
+                    return Ok(());
+                }
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let socket = socket_file(&socket_root(), &fs::canonicalize(directory)?);
+        if fs::symlink_metadata(&socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            fs::remove_file(&socket)?;
+        }
+        // Remove the lock last so a racing daemon cannot claim a half-removed directory.
+        files.sort_by_key(|file| file.ends_with(LOCK_FILE));
+        for file in files {
+            fs::remove_file(file)?;
+        }
+        fs::remove_dir(directory)?;
         Ok(())
     }
 
-    fn socket_path(directory: &std::path::Path) -> Result<PathBuf> {
+    fn process_exists(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal zero only checks whether the PID exists.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    fn socket_path(directory: &Path) -> Result<PathBuf> {
         let directory =
             fs::canonicalize(directory).context("failed to resolve PTY runtime directory")?;
-        let digest = Sha256::digest(directory.as_os_str().as_bytes());
+        let root = socket_root();
+        ensure_private_directory(&root)?;
+        Ok(socket_file(&root, &directory))
+    }
+
+    // Sockets stay in /tmp so their paths fit sun_path; temp cleaners skip sockets.
+    fn socket_root() -> PathBuf {
+        PathBuf::from("/tmp").join(format!(
+            "opencode-pty-{}",
+            nix::unistd::Uid::effective().as_raw()
+        ))
+    }
+
+    fn socket_file(root: &Path, canonical_directory: &Path) -> PathBuf {
+        let digest = Sha256::digest(canonical_directory.as_os_str().as_bytes());
         let name = digest[..16]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let root = PathBuf::from("/tmp").join(format!(
-            "opencode-pty-{}",
-            nix::unistd::Uid::effective().as_raw()
-        ));
-        ensure_private_directory(&root)?;
-        Ok(root.join(format!("{name}.sock")))
+        root.join(format!("{name}.sock"))
     }
 
     fn ensure_private_directory(directory: &std::path::Path) -> Result<()> {
@@ -625,6 +793,130 @@ mod unix {
             assert_eq!(first_socket.parent(), second_socket.parent());
 
             fs::remove_dir_all(base).unwrap();
+        }
+
+        #[test]
+        fn runtime_root_avoids_temporary_directories() {
+            let home = Some(PathBuf::from("/home/user"));
+            assert_eq!(
+                resolve_runtime_root(
+                    Some("/run/user/1".into()),
+                    Some("/state".into()),
+                    home.clone()
+                ),
+                PathBuf::from("/run/user/1/opencode-pty")
+            );
+            assert_eq!(
+                resolve_runtime_root(Some("relative".into()), Some("/state".into()), home.clone()),
+                PathBuf::from("/state/opencode/pty")
+            );
+            assert_eq!(
+                resolve_runtime_root(None, Some("relative".into()), home.clone()),
+                PathBuf::from("/home/user/.local/state/opencode/pty")
+            );
+            assert_eq!(
+                resolve_runtime_root(None, None, home),
+                PathBuf::from("/home/user/.local/state/opencode/pty")
+            );
+        }
+
+        struct Root(PathBuf);
+
+        impl Root {
+            fn new() -> Self {
+                let root =
+                    std::env::temp_dir().join(format!("opencode-pty-sweep-test-{}", random_id()));
+                fs::create_dir_all(&root).unwrap();
+                Self(root)
+            }
+
+            fn runtime(&self, files: &[&str], pid: Option<u32>) -> PathBuf {
+                let directory = self.0.join(random_id());
+                fs::create_dir(&directory).unwrap();
+                for file in files {
+                    fs::write(directory.join(file), b"").unwrap();
+                }
+                if let Some(pid) = pid {
+                    let registration = Registration {
+                        instance_id: random_id(),
+                        pid,
+                        protocol: PROTOCOL_VERSION,
+                        socket: PathBuf::from("/nonexistent.sock"),
+                        token: random_id(),
+                    };
+                    fs::write(
+                        directory.join(REGISTRATION_FILE),
+                        serde_json::to_vec(&registration).unwrap(),
+                    )
+                    .unwrap();
+                }
+                directory
+            }
+        }
+
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn later() -> SystemTime {
+            SystemTime::now() + STALE_RUNTIME_AGE + Duration::from_secs(1)
+        }
+
+        fn dead_pid() -> u32 {
+            let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        }
+
+        #[test]
+        fn sweep_removes_only_abandoned_old_runtimes() {
+            let root = Root::new();
+            let abandoned = root.runtime(&[LOCK_FILE, REGISTRATION_FILE], None);
+            let young = root.runtime(&[LOCK_FILE], None);
+            let foreign = root.runtime(&[LOCK_FILE, "notes.txt"], None);
+            let locked = root.runtime(&[LOCK_FILE], None);
+            let held = fs::File::open(locked.join(LOCK_FILE)).unwrap();
+            held.try_lock_exclusive().unwrap();
+
+            sweep_runtime(&abandoned, later()).unwrap();
+            sweep_runtime(&young, SystemTime::now()).unwrap();
+            sweep_runtime(&foreign, later()).unwrap();
+            sweep_runtime(&locked, later()).unwrap();
+
+            assert!(!abandoned.exists());
+            assert!(young.join(LOCK_FILE).exists());
+            assert!(foreign.join("notes.txt").exists());
+            assert!(locked.join(LOCK_FILE).exists());
+            drop(held);
+        }
+
+        #[test]
+        fn sweep_without_lock_file_checks_registered_pid() {
+            let root = Root::new();
+            let live = root.runtime(&[], Some(std::process::id()));
+            let dead = root.runtime(&[], Some(dead_pid()));
+
+            sweep_runtime(&live, later()).unwrap();
+            sweep_runtime(&dead, later()).unwrap();
+
+            assert!(live.join(REGISTRATION_FILE).exists());
+            assert!(!dead.exists());
+        }
+
+        #[test]
+        fn sweep_removes_abandoned_socket() {
+            let root = Root::new();
+            let abandoned = root.runtime(&[LOCK_FILE], None);
+            let socket = socket_path(&abandoned).unwrap();
+            drop(UnixListener::bind(&socket).unwrap());
+
+            sweep_runtime(&abandoned, later()).unwrap();
+
+            assert!(!abandoned.exists());
+            assert!(!socket.exists());
         }
     }
 }

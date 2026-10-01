@@ -33,6 +33,15 @@ cancels the handoff. An ordinary authenticated `shutdown` request, or one from t
 current owner, stops the daemon even during handoff. No ownership or handoff state
 is persisted.
 
+The registration (`service.json`) and lock (`service.lock`) live in
+`OPENCODE_PTY_RUNTIME_DIR`, defaulting to `$XDG_RUNTIME_DIR/opencode-pty`, then
+`$XDG_STATE_HOME/opencode/pty`, then `~/.local/state/opencode/pty`. They never
+default to a temporary directory, because macOS deletes unaccessed regular files
+there after three days. The socket stays under `/tmp/opencode-pty-<uid>/` to fit
+socket path limits; temporary cleaners skip sockets. A stopping daemon removes
+its own files and runtime directory, and a starting daemon removes abandoned
+sibling runtime directories older than ten minutes.
+
 ## Architecture
 
 ```text

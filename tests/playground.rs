@@ -74,7 +74,7 @@ fn playground_proves_authoritative_query_response() {
         .expect("commands written");
     let output = output_with_timeout(child);
     assert!(!runtime.join("service.json").exists());
-    std::fs::remove_dir_all(&runtime).unwrap();
+    assert!(!runtime.exists(), "runtime directory was not removed");
     assert!(
         output.status.success(),
         "{}",
@@ -160,7 +160,7 @@ fn playground_exit_stops_all_terminals_and_observers_do_not_start_daemons() {
         );
         assert!(!runtime.join("service.json").exists());
     }
-    std::fs::remove_dir_all(&runtime).unwrap();
+    assert!(!runtime.exists(), "runtime directory was not removed");
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn observer_stream_replays_and_follows_until_exit() {
     owner.stdin.as_mut().unwrap().write_all(b"quit\n").unwrap();
     assert!(output_with_timeout(owner).status.success());
     assert!(!runtime.join("service.json").exists());
-    std::fs::remove_dir_all(&runtime).unwrap();
+    assert!(!runtime.exists(), "runtime directory was not removed");
     assert!(
         watched.status.success(),
         "watch failed with {:?}: {}",

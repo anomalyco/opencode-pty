@@ -116,6 +116,17 @@ service lock elects one process and protects stale socket cleanup. On Unix, the
 socket uses a fixed-length hash of the canonical runtime path
 under a private per-user `/tmp` directory to stay below platform path limits.
 
+`OPENCODE_PTY_RUNTIME_DIR` selects the runtime directory. Otherwise it is
+`$XDG_RUNTIME_DIR/opencode-pty`, then `$XDG_STATE_HOME/opencode/pty`, then
+`~/.local/state/opencode/pty`. Registration never defaults to a temporary
+directory: macOS deletes regular files there that are unaccessed for three
+days, even while the daemon runs. Temporary cleaners skip sockets, so the
+socket stays in `/tmp`. On exit the daemon removes its registration and socket
+only if they are still its own, then its empty runtime directory. At startup
+it removes sibling runtime directories in that shared root that are over ten
+minutes old, contain only registration files, and whose lock it can acquire;
+without a lock file, the registered PID must no longer exist.
+
 OpenCode chooses a fresh UUID runtime directory for each server, independent of
 the database. It starts the daemon only when the first terminal is created.
 Only an explicit restart handoff descriptor lets a replacement server reuse
