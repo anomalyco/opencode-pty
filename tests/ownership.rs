@@ -1,9 +1,10 @@
 #![cfg(unix)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Barrier;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -222,23 +223,16 @@ fn handoff_preserves_daemon_and_terminal_and_shutdown_overrides_it() {
     } if repeated == ticket && deadline == expires_at)
     );
     assert!(matches!(
-        daemon.own(Some(ticket.clone())).1,
+        daemon.own(Some("wrong-ticket".into())).1,
         Response::Error { .. }
     ));
+    // The old owner stays connected until the successor has acquired the daemon.
+    let (mut successor, response) = daemon.own(Some(ticket.clone()));
+    assert!(matches!(response, Response::Owned));
+    assert!(matches!(daemon.own(Some(ticket)).1, Response::Error { .. }));
     drop(owner);
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut successor = loop {
-        let (stream, response) = daemon.own(Some(ticket.clone()));
-        if matches!(response, Response::Owned) {
-            break stream;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "successor could not acquire: {response:?}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    };
     assert!(
         matches!(daemon.request(Request::Ping), Response::Pong { instance_id, pid, .. }
         if instance_id == daemon.registration.instance_id && pid == daemon.child.id())
@@ -274,6 +268,78 @@ fn handoff_preserves_daemon_and_terminal_and_shutdown_overrides_it() {
     assert!(matches!(daemon.request(Request::Shutdown), Response::Ok));
     daemon.wait();
     assert_terminal_stopped(&terminal);
+}
+
+#[test]
+fn superseded_owner_cannot_prepare_handoff_or_shutdown() {
+    for request in [Request::PrepareHandoff, Request::Shutdown] {
+        let mut daemon = Daemon::start();
+        let (mut owner, response) = daemon.own(None);
+        assert!(matches!(response, Response::Owned));
+        let Response::Handoff { ticket, .. } = daemon.send(&mut owner, Request::PrepareHandoff)
+        else {
+            panic!("handoff response");
+        };
+        let (mut successor, response) = daemon.own(Some(ticket));
+        assert!(matches!(response, Response::Owned));
+        assert!(matches!(
+            daemon.send(&mut owner, request),
+            Response::Error { message } if message == "owner connection has been superseded"
+        ));
+        // EOF confirms the stale handler has run its disconnect cleanup.
+        assert_eq!(owner.read(&mut [0]).unwrap(), 0);
+        assert!(matches!(
+            daemon.request(Request::Ping),
+            Response::Pong { .. }
+        ));
+        assert!(matches!(
+            daemon.send(&mut successor, Request::PrepareHandoff),
+            Response::Handoff { .. }
+        ));
+        assert!(matches!(
+            daemon.send(&mut successor, Request::Shutdown),
+            Response::Ok
+        ));
+        daemon.wait();
+    }
+}
+
+#[test]
+fn handoff_ticket_has_only_one_winner() {
+    let mut daemon = Daemon::start();
+    let (mut owner, response) = daemon.own(None);
+    assert!(matches!(response, Response::Owned));
+    let Response::Handoff { ticket, .. } = daemon.send(&mut owner, Request::PrepareHandoff) else {
+        panic!("handoff response");
+    };
+    let barrier = Barrier::new(2);
+    let results = thread::scope(|scope| {
+        let claim = || {
+            barrier.wait();
+            daemon.own(Some(ticket.clone()))
+        };
+        let first = scope.spawn(claim);
+        let second = scope.spawn(claim);
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, response)| matches!(response, Response::Owned))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, response)| matches!(response, Response::Error { .. }))
+            .count(),
+        1
+    );
+    // Losing the new owner must stop the daemon even if the old socket is still open.
+    drop(results);
+    daemon.wait();
+    assert_eq!(owner.read(&mut [0]).unwrap(), 0);
 }
 
 #[test]

@@ -23,12 +23,15 @@ Losing the owner connection stops the daemon and its terminals unless the owner
 first sends `{"token":"...","request":{"op":"prepare_handoff"}}` on that same
 socket. The response is `{"type":"handoff","ticket":"...","expires_at":123}`,
 where `expires_at` is Unix milliseconds, 120 seconds from preparation. Repeated
-preparation during that window returns the same ticket and deadline. After the
-old owner disconnects, a successor claims the same instance with the ticket in
-its `own` request. A live owner cannot be displaced, and successful adoption
-consumes the ticket. Expiry stops an unowned daemon; if the old owner is still
-connected, expiry simply cancels the handoff. `shutdown` always stops the daemon,
-including during handoff. No ownership or handoff state is persisted.
+preparation during that window returns the same ticket and deadline. A successor
+claims the same instance with the ticket in its `own` request, even while the old
+owner is still connected. Successful adoption consumes the ticket atomically;
+only one successor can claim it. The superseded connection can no longer prepare
+handoffs or shut down the daemon, and its disconnect does not affect the new owner.
+Expiry stops an unowned daemon; if the old owner is still connected, expiry simply
+cancels the handoff. An ordinary authenticated `shutdown` request, or one from the
+current owner, stops the daemon even during handoff. No ownership or handoff state
+is persisted.
 
 ## Architecture
 
