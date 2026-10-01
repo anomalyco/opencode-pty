@@ -125,8 +125,9 @@ days, even while the daemon runs. Temporary cleaners skip sockets, so the
 socket stays in `/tmp`. On exit the daemon removes its registration and socket
 only if they are still its own, then its empty runtime directory. At startup
 it removes sibling runtime directories in `DIR` that are over ten
-minutes old, contain only registration files, and whose lock it can acquire;
-without a lock file, the registered PID must no longer exist.
+minutes old, contain only registration files, and have either a lock it can
+acquire or, without a lock file, a valid registration whose PID no longer
+exists. Directories without that evidence, including empty ones, are kept.
 
 OpenCode chooses a fresh UUID runtime directory for each server, independent of
 the database. It starts the daemon only when the first terminal is created.

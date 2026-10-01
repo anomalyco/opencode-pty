@@ -284,8 +284,13 @@ mod unix {
             files.push(entry.path());
         }
 
-        let lock_path = directory.join(LOCK_FILE);
-        let _lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        // Only a lock file or a parseable registration proves a daemon created this
+        // directory; anything else, including an empty directory, is left alone.
+        let _lock = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join(LOCK_FILE))
+        {
             Ok(lock) => {
                 if lock.try_lock_exclusive().is_err() {
                     return Ok(());
@@ -293,10 +298,13 @@ mod unix {
                 Some(lock)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let registration = fs::read(directory.join(REGISTRATION_FILE))
+                let Some(registration) = fs::read(registration_path(directory))
                     .ok()
-                    .and_then(|data| serde_json::from_slice::<Registration>(&data).ok());
-                if registration.is_some_and(|registration| process_exists(registration.pid)) {
+                    .and_then(|data| serde_json::from_slice::<Registration>(&data).ok())
+                else {
+                    return Ok(());
+                };
+                if process_exists(registration.pid) {
                     return Ok(());
                 }
                 None
@@ -914,6 +922,20 @@ mod unix {
 
             assert!(live.join(REGISTRATION_FILE).exists());
             assert!(!dead.exists());
+        }
+
+        #[test]
+        fn sweep_keeps_directories_without_daemon_evidence() {
+            let root = Root::new();
+            let empty = root.runtime(&[], None);
+            let foreign = root.runtime(&[], None);
+            fs::write(foreign.join(REGISTRATION_FILE), br#"{"not":"ours"}"#).unwrap();
+            let temporary = root.runtime(&["service.important.tmp"], None);
+
+            for directory in [&empty, &foreign, &temporary] {
+                sweep_runtime(directory, later()).unwrap();
+                assert!(directory.exists(), "{}", directory.display());
+            }
         }
 
         #[test]
