@@ -1,12 +1,13 @@
 use std::env;
 use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 
-use crate::daemon::{Registration, read_registration};
+use crate::daemon::{Registration, read_registration, runtime_dir};
 use crate::protocol::{
     AttachmentRole, Envelope, PROTOCOL_VERSION, Request, Response, SubscriptionEvent, read_frame,
     read_subscription_event, write_frame,
@@ -57,14 +58,24 @@ impl TerminalSubscription {
 
 impl TerminalClient {
     #[cfg(unix)]
-    pub fn start() -> Result<Self> {
+    pub fn start(directory: &Path) -> Result<Self> {
         use std::os::unix::net::UnixStream;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
+        let invalid = || anyhow!("invalid runtime directory {}", directory.display());
+        let name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(invalid)?;
+        let root = directory.parent().ok_or_else(invalid)?;
         let mut command = Command::new(env::current_exe()?);
         command
             .arg("daemon")
+            .arg("--name")
+            .arg(name)
+            .arg("--runtime-dir")
+            .arg(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -79,7 +90,7 @@ impl TerminalClient {
             if let Some(status) = child.try_wait()? {
                 bail!("opencode-pty daemon exited before ownership acquisition: {status}");
             }
-            if let Ok(registration) = read_registration()
+            if let Ok(registration) = read_registration(directory)
                 && registration.pid == child.id()
             {
                 let mut stream = UnixStream::connect(&registration.socket)?;
@@ -109,12 +120,12 @@ impl TerminalClient {
     }
 
     #[cfg(not(unix))]
-    pub fn start() -> Result<Self> {
+    pub fn start(_directory: &Path) -> Result<Self> {
         bail!("opencode-pty client transport is not implemented on this platform")
     }
 
-    pub fn discover() -> Result<Self> {
-        let registration = read_registration()?;
+    pub fn discover(directory: &Path) -> Result<Self> {
+        let registration = read_registration(directory)?;
         if registration.protocol != PROTOCOL_VERSION {
             bail!(
                 "opencode-pty protocol mismatch: service={}, client={PROTOCOL_VERSION}",
@@ -404,25 +415,52 @@ impl Drop for TerminalClient {
 
 pub fn run_cli() -> Result<()> {
     let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some("daemon") => {
-            if args.next().is_some() {
-                bail!("usage: opencode-pty daemon");
+    let command = args.next();
+    let mut name = None;
+    let mut root = None;
+    let mut positional = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" => name = Some(args.next().ok_or_else(|| anyhow!("--name needs a value"))?),
+            "--runtime-dir" => {
+                root = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--runtime-dir needs a value"))?,
+                ))
             }
-            crate::daemon::run()
+            _ => positional.push(arg),
+        }
+    }
+    let directory = || -> Result<PathBuf> {
+        let name = name
+            .as_deref()
+            .ok_or_else(|| anyhow!("--name is required; use `opencode-pty help`"))?;
+        runtime_dir(root.as_deref(), name)
+    };
+    let no_arguments = |usage: &str| {
+        if positional.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!("usage: opencode-pty {usage}"))
+        }
+    };
+    match command.as_deref() {
+        Some("daemon") => {
+            no_arguments("daemon --name NAME [--runtime-dir DIR]")?;
+            crate::daemon::run(&directory()?)
         }
         Some("fixture") => run_fixture(),
-        None | Some("play") => play(),
-        Some("status") => status(),
-        Some("stop") => stop(),
-        Some("list") => print_terminals(&TerminalClient::discover()?),
+        Some("play") => play(&directory()?),
+        Some("status") => status(&directory()?),
+        Some("stop") => stop(&directory()?),
+        Some("list") => print_terminals(&TerminalClient::discover(&directory()?)?),
         Some("watch") => {
-            let id = args
-                .next()
-                .ok_or_else(|| anyhow!("usage: opencode-pty watch TERMINAL_ID"))?
+            let id = positional
+                .first()
+                .ok_or_else(|| anyhow!("usage: opencode-pty watch TERMINAL_ID --name NAME"))?
                 .parse()
                 .context("expected terminal ID")?;
-            watch(id)
+            watch(&directory()?, id)
         }
         Some("version" | "--version" | "-V") => {
             println!(
@@ -432,7 +470,7 @@ pub fn run_cli() -> Result<()> {
             );
             Ok(())
         }
-        Some("help" | "--help" | "-h") => {
+        None | Some("help" | "--help" | "-h") => {
             print_usage();
             Ok(())
         }
@@ -440,8 +478,8 @@ pub fn run_cli() -> Result<()> {
     }
 }
 
-fn status() -> Result<()> {
-    let client = TerminalClient::discover()?;
+fn status(directory: &Path) -> Result<()> {
+    let client = TerminalClient::discover(directory)?;
     println!(
         "opencode-pty running: pid={} instance={} terminals={}",
         client.registration.pid,
@@ -451,13 +489,13 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-fn stop() -> Result<()> {
-    let client = TerminalClient::discover()?;
+fn stop(directory: &Path) -> Result<()> {
+    let client = TerminalClient::discover(directory)?;
     let pid = client.registration.pid;
     client.shutdown()?;
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
-        if TerminalClient::discover().is_err() {
+        if TerminalClient::discover(directory).is_err() {
             println!("stopped opencode-pty pid={pid} (all terminals exited)");
             return Ok(());
         }
@@ -467,8 +505,8 @@ fn stop() -> Result<()> {
 }
 
 #[cfg(unix)]
-fn watch(id: TerminalId) -> Result<()> {
-    let client = TerminalClient::discover()?;
+fn watch(directory: &Path, id: TerminalId) -> Result<()> {
+    let client = TerminalClient::discover(directory)?;
     let attachment_id = format!(
         "watch-{}-{:016x}",
         std::process::id(),
@@ -503,12 +541,12 @@ fn watch(id: TerminalId) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn watch(_id: TerminalId) -> Result<()> {
+fn watch(_directory: &Path, _id: TerminalId) -> Result<()> {
     bail!("streaming transport is not implemented on this platform")
 }
 
-fn play() -> Result<()> {
-    let client = TerminalClient::start()?;
+fn play(directory: &Path) -> Result<()> {
+    let client = TerminalClient::start(directory)?;
     let mut active = client.list()?.first().map(|terminal| terminal.id);
     println!("\n  opencode-pty playground");
     println!(
@@ -682,7 +720,13 @@ fn set_stdin_raw() -> Result<()> {
 }
 
 fn print_usage() {
-    println!("usage: opencode-pty [play|status|list|watch ID|stop|daemon|--version]");
+    println!(
+        "usage: opencode-pty [play|status|list|watch ID|stop|daemon] --name NAME [--runtime-dir DIR]"
+    );
+    println!("       opencode-pty --version");
+    println!(
+        "  NAME selects DIR/NAME; DIR defaults to ${{XDG_STATE_HOME:-~/.local/state}}/opencode/pty"
+    );
 }
 
 fn print_help() {
