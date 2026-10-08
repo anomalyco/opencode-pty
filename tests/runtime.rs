@@ -50,7 +50,8 @@ fn real_child_input_output_unicode_and_snapshots() {
     );
     let replay = service.replay(info.id, 0).unwrap();
     assert!(!replay.truncated);
-    assert_eq!(replay.end_offset, snapshot.info.output_tail);
+    // ConPTY may repaint after the earlier snapshot, so offsets only grow.
+    assert!(replay.end_offset >= snapshot.info.output_tail);
     assert_eq!(replay.bytes.len() as u64, replay.end_offset);
     assert!(
         service
@@ -142,10 +143,18 @@ fn resize_updates_real_console_and_parser() {
         .unwrap();
     for (cols, rows) in [(100, 40), (60, 18)] {
         service.resize(info.id, cols, rows).unwrap();
-        assert_eq!(
-            child.command(Command::Size),
-            serde_json::json!([cols, rows])
-        );
+        // ConPTY applies a resize asynchronously in conhost, so the child can
+        // briefly observe the old size after `resize` returns.
+        let expected = serde_json::json!([cols, rows]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let size = child.command(Command::Size);
+            if size == expected {
+                break;
+            }
+            assert!(Instant::now() < deadline, "console size stayed {size}");
+            thread::sleep(Duration::from_millis(10));
+        }
         let snapshot = service.snapshot(info.id).unwrap();
         assert_eq!((snapshot.info.cols, snapshot.info.rows), (cols, rows));
         assert_eq!(
@@ -188,9 +197,10 @@ fn terminal_query_response_reaches_child() {
     );
     service.write(info.id, b"!".to_vec()).unwrap();
     assert_eq!(child.command(Command::Read(1)), serde_json::json!(b"!"));
-    // ConPTY consumes application DSR itself, but portable-pty enables cursor
-    // inheritance: ConPTY's own DSR must pass through Ghostty and our writer to
-    // initialize the console. On Unix, the application's query passes through.
+    // ConPTY answers application DSR itself; on Unix, Ghostty answers it. With
+    // cursor inheritance enabled, ConPTY's own startup DSR still appears in the
+    // output stream, so this checks the query reaches the reader and parser.
+    // It does not prove a reply was written back on Windows.
     let replay = service.replay(info.id, 0).unwrap();
     assert!(
         replay.bytes.windows(4).any(|bytes| bytes == b"\x1b[6n"),

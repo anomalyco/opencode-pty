@@ -117,9 +117,10 @@ pub struct Deadline(mpsc::Sender<()>);
 impl Deadline {
     pub fn new() -> Self {
         let (send, receive) = mpsc::channel();
+        let test = thread::current().name().unwrap_or("unknown").to_owned();
         thread::spawn(move || {
             if receive.recv_timeout(Duration::from_secs(45)).is_err() {
-                eprintln!("PTY runtime test exceeded 45 seconds");
+                eprintln!("PTY runtime test {test} exceeded 45 seconds");
                 std::process::exit(124);
             }
         });
@@ -136,7 +137,11 @@ impl Drop for Deadline {
 #[test]
 #[ignore = "subprocess fixture, launched with a private control channel"]
 fn child() {
-    let address = env::var(ADDRESS).expect("fixture must be launched by a test");
+    // `cargo test -- --include-ignored` runs this entry directly; only a test
+    // that launched it provides the control channel.
+    let Ok(address) = env::var(ADDRESS) else {
+        return;
+    };
     configure_console();
     let stream = TcpStream::connect(address).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();

@@ -267,7 +267,7 @@ using real self-spawned Rust console children. It covers input/output, Unicode,
 cwd/environment/argument and executable-path handling, OS console resize,
 snapshots, bounded replay, terminal replies, and independent terminals. ConPTY
 can consume application terminal queries itself; the tests also check its
-cursor-inheritance query reaches our Ghostty parser/writer path.
+cursor-inheritance query reaches our reader and Ghostty parser.
 
 The reusable fixture in `tests/support/terminal_fixture.rs` returns a
 `CreateTerminal` request and uses a separate control/observation channel, so

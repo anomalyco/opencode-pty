@@ -148,6 +148,6 @@ jobs:
           This job builds the executable and runs all enabled tests natively, including libghostty parser, protocol, and direct TerminalService ConPTY runtime tests.
           The runtime suite spawns real Rust console children and checks input/output, Unicode, cwd/environment/argv/PATH, OS resize, snapshots, replay, terminal replies, and independent terminals.
           The older service, ownership, playground, and rows integration suites remain Unix-only.
-          A passing run does not imply Windows named-pipe transport or complete ConPTY shutdown coverage is implemented.
+          A passing run does not imply Windows daemon support or complete ConPTY shutdown coverage is implemented.
           No packages or releases are published.
           "@ >> $env:GITHUB_STEP_SUMMARY
