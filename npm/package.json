@@ -29,7 +29,9 @@
     "@opencode-ai/pty-linux-arm64-gnu": "0.3.0",
     "@opencode-ai/pty-linux-arm64-musl": "0.3.0",
     "@opencode-ai/pty-linux-x64-gnu": "0.3.0",
-    "@opencode-ai/pty-linux-x64-musl": "0.3.0"
+    "@opencode-ai/pty-linux-x64-musl": "0.3.0",
+    "@opencode-ai/pty-win32-arm64": "0.3.0",
+    "@opencode-ai/pty-win32-x64": "0.3.0"
   },
   "publishConfig": {
     "access": "public"

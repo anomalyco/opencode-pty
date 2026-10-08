@@ -17,6 +17,8 @@ const targets = [
   { target: "aarch64-unknown-linux-musl", platform: "linux", arch: "arm64", libc: "musl", suffix: "musl" },
   { target: "x86_64-unknown-linux-gnu", platform: "linux", arch: "x64", libc: "glibc", suffix: "gnu" },
   { target: "x86_64-unknown-linux-musl", platform: "linux", arch: "x64", libc: "musl", suffix: "musl" },
+  { target: "aarch64-pc-windows-msvc", platform: "win32", arch: "arm64" },
+  { target: "x86_64-pc-windows-msvc", platform: "win32", arch: "x64" },
 ]
 
 await rm(output, { recursive: true, force: true })
@@ -27,12 +29,13 @@ for (const target of targets) {
   const name = `@opencode-ai/pty-${suffix}`
   const directory = path.join(output, `opencode-pty-${suffix}`)
   const archive = path.join(dist, `opencode-pty-${manifest.version}-${target.target}.tar.gz`)
+  const binary = target.platform === "win32" ? "opencode-pty.exe" : "opencode-pty"
   const temporary = await mkdtemp(path.join(os.tmpdir(), "opencode-pty-npm-"))
   try {
     execFileSync("tar", ["-xzf", archive, "-C", temporary])
-    const executable = path.join(temporary, `opencode-pty-${manifest.version}-${target.target}`, "opencode-pty")
+    const executable = path.join(temporary, `opencode-pty-${manifest.version}-${target.target}`, binary)
     await mkdir(path.join(directory, "bin"), { recursive: true })
-    await copyFile(executable, path.join(directory, "bin", "opencode-pty"))
+    await copyFile(executable, path.join(directory, "bin", binary))
     await copyFile(path.join(root, "LICENSE"), path.join(directory, "LICENSE"))
     await writeFile(
       path.join(directory, "package.json"),
@@ -46,7 +49,7 @@ for (const target of targets) {
           os: [target.platform],
           cpu: [target.arch],
           ...(target.libc ? { libc: [target.libc] } : {}),
-          exports: { "./package.json": "./package.json", "./bin/opencode-pty": "./bin/opencode-pty" },
+          exports: { "./package.json": "./package.json", [`./bin/${binary}`]: `./bin/${binary}` },
           files: ["bin"],
           publishConfig: { access: "public" },
         },

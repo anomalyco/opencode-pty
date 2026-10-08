@@ -6,6 +6,13 @@ on:
       - master
     tags:
       - "v*"
+  # Validate release-pipeline changes before merge. Publishing remains tag-only.
+  pull_request:
+    paths:
+      - .github/workflows/publish.yml
+      - build.rs
+      - npm/**
+      - script/npm-packages.mjs
 
 permissions:
   contents: read
@@ -133,8 +140,98 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  build-windows:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            arch: x64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      RUSTUP_TOOLCHAIN: 1.90.0-x86_64-pc-windows-msvc
+      # Portable CPU for Ghostty (see build.rs) and no Visual C++ runtime dependency.
+      OPENCODE_ZIG_CPU: baseline
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Enable long dependency paths
+        run: git config --global core.longpaths true
+      - uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        if: matrix.arch == 'x64'
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: release-${{ matrix.target }}
+      # Zig 0.16 crashes when building Ghostty on the native ARM64 host, so use
+      # the x64-hosted compiler there (matching windows.yml).
+      - name: Install x64 Zig for ARM64 cross-compilation
+        if: matrix.arch == 'arm64'
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zig-x64.zip'
+          Invoke-WebRequest 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e') { throw 'Zig archive checksum mismatch' }
+          Expand-Archive $archive -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0' >> $env:GITHUB_PATH
+      - name: Fix Zig 0.16 ARM64 function-pointer alignment
+        if: matrix.arch == 'arm64'
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0/lib/std/debug/SelfInfo/Windows.zig'
+          $source = [System.IO.File]::ReadAllText($file)
+          $old = '@ptrCast(try si.loadNtdllProc(@tagName(proc)))'
+          if (!$source.Contains($old)) { throw 'Zig alignment workaround no longer matches; re-evaluate it' }
+          [System.IO.File]::WriteAllText($file, $source.Replace($old, '@ptrCast(@alignCast(try si.loadNtdllProc(@tagName(proc))))'))
+      - name: Install Rust toolchain and target
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --force-non-host --profile minimal --target $env:CARGO_BUILD_TARGET
+      - name: Build
+        run: cargo build --locked --release
+      - name: Smoke test
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'opencode-pty').version
+          $binary = "target/$env:CARGO_BUILD_TARGET/release/opencode-pty.exe"
+          $output = & $binary --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($output -ne "opencode-pty $version (protocol $env:PROTOCOL_VERSION)") { throw "Unexpected version output: $output" }
+          # Start a real daemon over a named pipe; it stops when nobody claims it.
+          $runtime = Join-Path $env:RUNNER_TEMP 'opencode-pty-release-smoke'
+          $daemon = Start-Process $binary -ArgumentList @('daemon', '--runtime-dir', $runtime, '--name', 'smoke') -PassThru -NoNewWindow
+          $deadline = (Get-Date).AddSeconds(10)
+          while (!(Test-Path (Join-Path $runtime 'smoke/service.json'))) {
+            if ($daemon.HasExited -or (Get-Date) -gt $deadline) { throw 'daemon did not register' }
+            Start-Sleep -Milliseconds 50
+          }
+          if (!$daemon.WaitForExit(15000)) { $daemon.Kill(); throw 'unclaimed daemon did not stop' }
+          if (Test-Path (Join-Path $runtime 'smoke')) { throw 'runtime directory was not removed' }
+      - name: Package
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'opencode-pty').version
+          $name = "opencode-pty-$version-$env:CARGO_BUILD_TARGET"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item "target/$env:CARGO_BUILD_TARGET/release/opencode-pty.exe" "dist/$name/"
+          Copy-Item LICENSE, README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" $name
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-pty-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -156,7 +253,7 @@ jobs:
       - name: Create checksums and manifest
         working-directory: dist
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$(node -p 'require("../npm/package.json").version')"
           sha256sum opencode-pty-*.tar.gz > SHA256SUMS
           artifacts='[]'
           while read -r sha256 archive; do
