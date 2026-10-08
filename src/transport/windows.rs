@@ -23,8 +23,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
@@ -70,6 +71,8 @@ impl Listener {
         let previous = std::mem::replace(&mut self.pending, next);
         Ok(Some(Connection {
             pipe: Arc::clone(&previous.operation.pipe),
+            read_timeout: None,
+            write_timeout: None,
         }))
     }
 
@@ -159,8 +162,10 @@ impl Pipe {
     }
 }
 
-pub(crate) struct Connection {
+pub struct Connection {
     pipe: Arc<Pipe>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 }
 
 impl Connection {
@@ -186,6 +191,8 @@ impl Connection {
                 Ok(handle) => {
                     return Ok(Self {
                         pipe: Arc::new(Pipe::new(handle)?),
+                        read_timeout: None,
+                        write_timeout: None,
                     });
                 }
                 Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
@@ -205,14 +212,49 @@ impl Connection {
         }
     }
 
-    pub fn cancellation(&self) -> io::Result<Cancellation> {
+    /// Connects only if the pipe server is the registered daemon process.
+    ///
+    /// Pipe names are visible to other local users. After a daemon crash its
+    /// registration remains, and another user could create a pipe with the
+    /// stale name; the endpoint's protections only last while the daemon holds
+    /// it. Clients must verify the server before sending credentials or input.
+    pub fn connect_to(endpoint: &Path, server_pid: u32) -> io::Result<Self> {
+        let connection = Self::connect(endpoint)?;
+        let mut pid = 0;
+        // SAFETY: the connection owns a live pipe handle; pid is valid output.
+        if unsafe { GetNamedPipeServerProcessId(connection.pipe.handle.as_raw_handle(), &mut pid) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if pid != server_pid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "named pipe server is not the registered opencode-pty daemon",
+            ));
+        }
+        Ok(connection)
+    }
+
+    /// A timed-out operation is cancelled but may already have transferred
+    /// some bytes, so the protocol stream is no longer framed reliably.
+    /// Discard the connection after any timeout error.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout;
+    }
+
+    pub(crate) fn cancellation(&self) -> io::Result<Cancellation> {
         Ok(Cancellation(Arc::clone(&self.pipe)))
     }
 
     /// Protocol 7 has an explicit response/final event, not a pipe half-close.
     /// Retain the pipe until the client reads that frame and closes its end.
     /// An uncooperative peer is cancelled after a bounded grace period.
-    pub fn finish_response(&mut self) -> io::Result<()> {
+    pub(crate) fn finish_response(&mut self) -> io::Result<()> {
         match self.read_with_timeout(&mut [0], Some(COMPLETION_TIMEOUT)) {
             Ok(0) => Ok(()),
             Ok(_) => Err(io::Error::new(
@@ -226,9 +268,11 @@ impl Connection {
         }
     }
 
-    pub fn monitor_disconnect(&self) -> io::Result<DisconnectMonitor> {
+    pub(crate) fn monitor_disconnect(&self) -> io::Result<DisconnectMonitor> {
         let mut reader = Self {
             pipe: Arc::clone(&self.pipe),
+            read_timeout: None,
+            write_timeout: None,
         };
         let cancellation = self.cancellation()?;
         let (sender, disconnected) = bounded(1);
@@ -282,7 +326,7 @@ impl Connection {
 
 impl Read for Connection {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.read_with_timeout(bytes, None)
+        self.read_with_timeout(bytes, self.read_timeout)
     }
 }
 
@@ -307,7 +351,7 @@ impl Write for Connection {
         })?;
         Ok(match ready {
             Some(count) => count,
-            None => operation.wait(None)?,
+            None => operation.wait(self.write_timeout)?,
         } as usize)
     }
 
@@ -670,6 +714,18 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
         monitor.finish();
+    }
+
+    #[test]
+    fn verified_connect_requires_the_expected_server_process() {
+        let endpoint = endpoint();
+        let mut listener = Listener::bind(&endpoint).unwrap();
+        let _verified = Connection::connect_to(&endpoint, std::process::id()).unwrap();
+        let _server = accept(&mut listener);
+        let error = Connection::connect_to(&endpoint, std::process::id().wrapping_add(4))
+            .err()
+            .expect("a different server process must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

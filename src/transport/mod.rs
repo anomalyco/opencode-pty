@@ -18,7 +18,7 @@ pub(crate) use unix::{Cancellation, Connection, Listener};
 #[cfg(windows)]
 mod retained;
 
-// The backend is exercised natively before the daemon entrypoint is enabled.
 #[cfg(windows)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod windows;
+#[cfg(windows)]
+pub(crate) use windows::{Cancellation, Connection, Listener};
