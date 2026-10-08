@@ -57,7 +57,7 @@ pub fn run(directory: &Path) -> Result<()> {
         }
     }
 
-    drop(listener);
+    listener.stop();
     // Unblock partial requests, owner reads, and backpressured subscriptions
     // before joining. PTY workers still use their existing termination path.
     for (cancellation, _) in &handlers {
@@ -78,6 +78,7 @@ pub fn run(directory: &Path) -> Result<()> {
     }
     drop(service);
     let result = runtime.finish();
+    drop(listener);
     let _ = cleanup_tx.send(());
     let _ = watchdog.join();
     result

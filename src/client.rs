@@ -8,10 +8,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 
 use crate::daemon::{Registration, read_registration, runtime_dir};
+#[cfg(unix)]
 use crate::protocol::{
-    AttachmentRole, Envelope, PROTOCOL_VERSION, Request, Response, SubscriptionEvent, read_frame,
-    read_subscription_event, write_frame,
+    AttachmentRole, Envelope, SubscriptionEvent, read_frame, read_subscription_event, write_frame,
 };
+use crate::protocol::{PROTOCOL_VERSION, Request, Response};
 use crate::service::{CreateTerminal, TerminalId, TerminalInfo, TerminalRows};
 #[cfg(unix)]
 use crate::transport::Connection;
