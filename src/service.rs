@@ -328,7 +328,7 @@ impl TerminalService {
         takeover: bool,
     ) -> Result<TerminalAttachment> {
         let terminal = self.get(id)?;
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = bounded(1);
         terminal
             .actor_tx
             .send(ActorMessage::Attach {
@@ -339,9 +339,7 @@ impl TerminalService {
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("terminal actor stopped"))?;
-        let attached = reply_rx
-            .recv()
-            .context("terminal actor dropped attach response")??;
+        let attached = await_reply(&reply_rx, &terminal.actor_done)?;
         Ok(TerminalAttachment {
             terminal: terminal.info(),
             role,
@@ -403,6 +401,8 @@ impl Drop for TerminalService {
 
 struct TerminalHandle {
     actor_tx: Sender<ActorMessage>,
+    /// Disconnects when the actor thread exits; never carries a message.
+    actor_done: Receiver<()>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     info: Arc<RwLock<TerminalInfo>>,
@@ -475,9 +475,11 @@ impl TerminalHandle {
         let actor_info = Arc::clone(&info);
         let actor_writer_tx = writer_tx.clone();
         let actor_shutdown = shutdown.clone();
+        let (actor_done_tx, actor_done) = bounded::<()>(0);
         let actor_thread = thread::Builder::new()
             .name(format!("opencode-pty-actor-{id}"))
             .spawn(move || {
+                let _actor_done = actor_done_tx;
                 let result = run_actor(ActorConfig {
                     master: ActorMaster {
                         pty: Some(pair.master),
@@ -579,6 +581,7 @@ impl TerminalHandle {
 
         Ok(Self {
             actor_tx,
+            actor_done,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             killer: Mutex::new(killer),
             info,
@@ -598,15 +601,12 @@ impl TerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
-    fn request<T>(
-        &self,
-        make: impl FnOnce(std_mpsc::SyncSender<Result<T>>) -> ActorMessage,
-    ) -> Result<T> {
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+    fn request<T>(&self, make: impl FnOnce(Reply<Result<T>>) -> ActorMessage) -> Result<T> {
+        let (reply_tx, reply_rx) = bounded(1);
         self.actor_tx
             .send(make(reply_tx))
             .map_err(|_| anyhow!("terminal actor stopped"))?;
-        reply_rx.recv().context("terminal actor dropped response")?
+        await_reply(&reply_rx, &self.actor_done)
     }
 
     fn shutdown(&self) -> Result<()> {
@@ -633,6 +633,21 @@ impl TerminalHandle {
     }
 }
 
+type Reply<T> = Sender<T>;
+
+/// A request accepted into the actor queue may never be handled: shutdown
+/// overtakes queued work, and a stopped actor's buffered messages (with their
+/// reply senders) stay alive while other handles hold queue senders. Waiting on
+/// the actor's lifetime as well as the reply keeps callers from blocking forever.
+fn await_reply<T>(reply: &Receiver<Result<T>>, actor_done: &Receiver<()>) -> Result<T> {
+    crossbeam_channel::select_biased! {
+        recv(reply) -> result => result.map_err(|_| anyhow!("terminal actor dropped response"))?,
+        recv(actor_done) -> _ => reply
+            .try_recv()
+            .map_err(|_| anyhow!("terminal actor stopped"))?,
+    }
+}
+
 enum ActorMessage {
     Output(Vec<u8>),
     ReaderEof,
@@ -640,43 +655,43 @@ enum ActorMessage {
     WriterFailed(String),
     ChildExited(Result<Option<u32>, String>),
     RefreshForegroundProcess {
-        reply: std_mpsc::SyncSender<Result<()>>,
+        reply: Reply<Result<()>>,
     },
     Write {
         attachment_id: Option<String>,
         bytes: Vec<u8>,
-        reply: std_mpsc::SyncSender<Result<()>>,
+        reply: Reply<Result<()>>,
     },
     Resize {
         attachment_id: Option<String>,
         cols: u16,
         rows: u16,
-        reply: std_mpsc::SyncSender<Result<()>>,
+        reply: Reply<Result<()>>,
     },
     Control {
         attachment_id: String,
         cols: u16,
         rows: u16,
         bytes: Option<Vec<u8>>,
-        reply: std_mpsc::SyncSender<Result<()>>,
+        reply: Reply<Result<()>>,
     },
     Snapshot {
-        reply: std_mpsc::SyncSender<Result<TerminalSnapshot>>,
+        reply: Reply<Result<TerminalSnapshot>>,
     },
     ReadRows {
         rows: Option<u16>,
-        reply: std_mpsc::SyncSender<Result<TerminalRows>>,
+        reply: Reply<Result<TerminalRows>>,
     },
     Replay {
         offset: u64,
-        reply: std_mpsc::SyncSender<Result<RawReplay>>,
+        reply: Reply<Result<RawReplay>>,
     },
     Attach {
         offset: u64,
         attachment_id: String,
         role: AttachmentRole,
         takeover: bool,
-        reply: std_mpsc::SyncSender<Result<Attached>>,
+        reply: Reply<Result<Attached>>,
     },
     Detach {
         attachment_id: String,
@@ -795,7 +810,16 @@ fn run_actor(config: ActorConfig) -> Result<()> {
             Ok(ActorMessage::Output(bytes)) => {
                 let (start, end) = replay.append(&bytes);
                 terminal.vt_write(&bytes);
-                if let Err(error) = forward_replies(&mut terminal, &writes, &shutdown) {
+                // Once the Windows master is handed off for closing, the writer
+                // may already have stopped; replies to the closing console are
+                // discarded so final output still reaches the real EOF.
+                #[cfg(windows)]
+                let closing = master.get().is_err();
+                #[cfg(not(windows))]
+                let closing = false;
+                if closing {
+                    terminal.take_writes();
+                } else if let Err(error) = forward_replies(&mut terminal, &writes, &shutdown) {
                     break Err(error);
                 }
                 update_offsets(&info, &replay);
@@ -1612,7 +1636,9 @@ mod tests {
             output_tail: 0,
         }));
         let actor_info = Arc::clone(&info);
+        let (actor_done_tx, actor_done) = bounded::<()>(0);
         let actor = thread::spawn(move || {
+            let _actor_done = actor_done_tx;
             run_actor(ActorConfig {
                 master: ActorMaster {
                     pty: Some(Box::new(TestMaster)),
@@ -1634,6 +1660,7 @@ mod tests {
         (
             TerminalHandle {
                 actor_tx,
+                actor_done,
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
                 killer: Mutex::new(Box::new(TestKiller)),
                 info,
@@ -1770,7 +1797,7 @@ mod tests {
             })
             .unwrap();
         assert!(writer.is_full());
-        let (reply, _reply_rx) = std_mpsc::sync_channel(1);
+        let (reply, _reply_rx) = bounded(1);
         actor
             .actor_tx
             .send(ActorMessage::Write {
@@ -1779,15 +1806,33 @@ mod tests {
                 reply,
             })
             .unwrap();
+        // Shutdown overtakes this queued request; its caller must still return.
+        let actor = Arc::new(actor);
+        let (queued_tx, queued) = std_mpsc::channel();
+        let requester = thread::spawn({
+            let actor = Arc::clone(&actor);
+            move || {
+                let _ = queued_tx.send(actor.request(|reply| ActorMessage::Snapshot { reply }));
+            }
+        });
         let (done, finished) = std_mpsc::channel();
-        let shutdown = thread::spawn(move || {
-            actor.shutdown().unwrap();
-            done.send(()).unwrap();
+        let shutdown = thread::spawn({
+            let actor = Arc::clone(&actor);
+            move || {
+                actor.shutdown().unwrap();
+                done.send(()).unwrap();
+            }
         });
         let stopped = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+        let queued = queued.recv_timeout(Duration::from_secs(1));
         drop(writer);
         shutdown.join().unwrap();
         assert!(stopped, "shutdown waited for the full input queue");
+        assert!(
+            queued.is_ok_and(|result| result.is_err()),
+            "a request queued before shutdown never returned"
+        );
+        requester.join().unwrap();
     }
 
     fn rows_terminal(cols: u16, rows: u16, input: &str) -> Terminal {

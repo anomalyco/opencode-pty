@@ -473,9 +473,11 @@ impl ChildProcess {
             use windows_sys::Win32::{
                 Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
             };
+            // Descendants exit asynchronously once their console closes, so allow
+            // a bounded wait. The root is already signaled when terminate returns.
             // SAFETY: the owned process handle has wait access and stays live.
             assert_eq!(
-                unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) },
+                unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 5000) },
                 WAIT_OBJECT_0
             );
         }
