@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const REGISTRATION_FILE: &str = "service.json";
@@ -57,21 +57,38 @@ pub fn registration_path(directory: &Path) -> PathBuf {
 }
 
 pub fn read_registration(directory: &Path) -> Result<Registration> {
-    let data = std::fs::read(registration_path(directory))
-        .context("opencode-pty registration is unavailable")?;
-    serde_json::from_slice(&data).context("invalid opencode-pty registration")
+    // Windows also verifies the file's owner and private ACL before trusting it.
+    #[cfg(windows)]
+    return platform::read_registration(directory);
+    #[cfg(not(windows))]
+    {
+        use anyhow::Context;
+        let data = std::fs::read(registration_path(directory))
+            .context("opencode-pty registration is unavailable")?;
+        serde_json::from_slice(&data).context("invalid opencode-pty registration")
+    }
 }
 
 #[cfg(unix)]
 #[path = "daemon/unix.rs"]
 mod platform;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "daemon/windows.rs"]
+mod platform;
+#[cfg(any(unix, windows))]
 mod server;
+#[cfg(any(unix, windows))]
+mod sweep;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use server::run;
 
-#[cfg(not(unix))]
+/// Minimal Windows byte-stream client for integrations using protocol framing.
+/// This does not start a daemon or implement the interactive TerminalClient CLI.
+#[cfg(windows)]
+pub use crate::transport::windows::Connection as PipeConnection;
+
+#[cfg(not(any(unix, windows)))]
 pub fn run(_directory: &Path) -> Result<()> {
     anyhow::bail!("persistent opencode-pty transport is not implemented on this platform")
 }
