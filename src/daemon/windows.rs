@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
@@ -179,8 +179,9 @@ pub(super) fn process_exists(pid: u32) -> bool {
     }
     // SAFETY: OpenProcess returned a new, uniquely owned handle.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    // A failed wait is treated as live, so the sweep never deletes on doubt.
     // SAFETY: the owned process handle stays valid through this zero-timeout wait.
-    unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
+    unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) != WAIT_OBJECT_0 }
 }
 
 /// Named pipes vanish with their server process; there is no endpoint to remove.

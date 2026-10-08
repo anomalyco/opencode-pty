@@ -47,7 +47,8 @@ impl Daemon {
     }
 
     fn connect(&self) -> PipeConnection {
-        let mut stream = PipeConnection::connect(&self.registration.socket).unwrap();
+        let mut stream =
+            PipeConnection::connect_to(&self.registration.socket, self.registration.pid).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5)));
         stream.set_write_timeout(Some(Duration::from_secs(5)));
         stream
@@ -160,8 +161,8 @@ fn spawn(directory: &Path) -> Child {
 fn registration(child: &mut Child, directory: &Path) -> Registration {
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
-        if let Ok(data) = std::fs::read(directory.join("service.json"))
-            && let Ok(registration) = serde_json::from_slice::<Registration>(&data)
+        // The checked reader also proves the published file is private.
+        if let Ok(registration) = opencode_pty::daemon::read_registration(directory)
             && registration.pid == child.id()
         {
             assert_eq!(registration.protocol, 7);

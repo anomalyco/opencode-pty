@@ -130,6 +130,16 @@ minutes old, contain only registration files, and have either a lock it can
 acquire or, without a lock file, a valid registration whose PID no longer
 exists. Directories without that evidence, including empty ones, are kept.
 
+On Windows the endpoint is a random per-instance named pipe instead of a
+socket. The runtime directory, lock, and registration carry a protected
+current-user-only ACL, and registration is atomically replaced with POSIX
+rename semantics. Clients verify the registration's owner and ACL, and check
+that the pipe server process matches the registered PID before sending the
+token. On exit the daemon removes its registration if still its own, then the
+lock file and runtime directory; the forced-exit watchdog removes only the
+registration, leaving the rest to a later sweep. The sweep checks liveness
+through the registered process object.
+
 OpenCode chooses a fresh UUID runtime directory for each server, independent of
 the database. It starts the daemon only when the first terminal is created.
 Only an explicit restart handoff descriptor lets a replacement server reuse

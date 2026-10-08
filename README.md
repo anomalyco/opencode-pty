@@ -91,9 +91,17 @@ file and runtime directory after releasing their handles. The abandoned-sibling
 sweep is shared with Unix; it checks liveness through the registered process
 object and has no endpoint file to remove.
 
+Registration publication uses `FileRenameInfoEx` with POSIX rename semantics,
+so the runtime directory must be on a local NTFS volume (Windows 10 1709 or
+later); there is no non-atomic fallback.
+
 The Windows Rust `TerminalClient` and interactive CLI are not ported. Integrations
 can use protocol 7 directly and the minimal `daemon::PipeConnection` byte-stream
-helper (connect plus optional read/write timeouts).
+helper. Connect with `PipeConnection::connect_to(socket, pid)`, which rejects a
+pipe whose server is not the registered daemon process: after a crash the stale
+registration's pipe name is free for another local user to create. Integrations
+in other languages must make the same `GetNamedPipeServerProcessId` check before
+sending the token. Discard a connection after any read/write timeout.
 
 ## Architecture
 
@@ -354,8 +362,8 @@ git tag v0.1.0
 push origin v0.1.0
 ```
 
-Windows artifacts are intentionally excluded until the persistent transport
-uses named pipes. Platform signing will be added later.
+Release artifacts do not yet include Windows builds. Platform signing will be
+added later.
 
 ## Current Limits
 
