@@ -215,6 +215,21 @@ fn registration(child: &mut Child, directory: &Path) -> Registration {
     }
 }
 
+/// ConPTY applies a resize asynchronously in conhost, so the child can briefly
+/// observe the old size after the daemon has acknowledged the request.
+fn wait_size(child: &mut terminal_fixture::Connection, cols: u16, rows: u16) {
+    let expected = serde_json::json!([cols, rows]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let size = child.command(FixtureCommand::Size);
+        if size == expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "console size stayed {size}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait(child: &mut Child) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -378,10 +393,7 @@ fn named_pipe_daemon_create_input_output_resize_and_shutdown() {
         }),
         Response::Ok
     ));
-    assert_eq!(
-        child.command(FixtureCommand::Size),
-        serde_json::json!([93, 31])
-    );
+    wait_size(&mut child, 93, 31);
     assert!(
         matches!(daemon.request(Request::Snapshot { id: terminal.id }), Response::Snapshot { text, .. } if text.contains("daemon-output"))
     );
@@ -612,10 +624,7 @@ fn observer_disconnect_and_control_input_preserve_independent_terminals() {
         first_child.command(FixtureCommand::Read(first_input.len())),
         serde_json::json!(first_input)
     );
-    assert_eq!(
-        first_child.command(FixtureCommand::Size),
-        serde_json::json!([91, 27])
-    );
+    wait_size(&mut first_child, 91, 27);
 
     assert!(matches!(
         daemon.request(Request::Control {
@@ -626,10 +635,7 @@ fn observer_disconnect_and_control_input_preserve_independent_terminals() {
         }),
         Response::Ok
     ));
-    assert_eq!(
-        second_child.command(FixtureCommand::Size),
-        serde_json::json!([73, 29])
-    );
+    wait_size(&mut second_child, 73, 29);
     let second_input = b"second-directed";
     assert!(matches!(
         daemon.request(Request::Input {
@@ -645,10 +651,7 @@ fn observer_disconnect_and_control_input_preserve_independent_terminals() {
         second_child.command(FixtureCommand::Read(second_input.len())),
         serde_json::json!(second_input)
     );
-    assert_eq!(
-        second_child.command(FixtureCommand::Size),
-        serde_json::json!([74, 30])
-    );
+    wait_size(&mut second_child, 74, 30);
     assert_eq!(
         first_child.command(FixtureCommand::Size),
         serde_json::json!([91, 27])
