@@ -343,15 +343,18 @@ gh run view RUN_ID --repo anomalyco/opencode-pty --log-failed
 
 Pushing a `vX.Y.Z` tag matching the version in `Cargo.toml` creates an unsigned
 GitHub release. The release contains x86-64 and arm64 binaries for Linux GNU,
-Linux musl, and macOS, plus `SHA256SUMS`, a machine-readable
+Linux musl, macOS, and Windows (MSVC, statically linked C runtime), plus
+`SHA256SUMS`, a machine-readable
 `release-manifest.json`, and GitHub build-provenance attestations. Release
 builds force Ghostty's Zig code generation to its baseline CPU target so
-artifacts do not inherit instruction-set extensions from CI runners. Linux GNU
-artifacts support glibc 2.30 and newer.
+artifacts do not inherit instruction-set extensions from CI runners (Windows
+builds set `OPENCODE_ZIG_CPU=baseline`, since the Unix Zig wrapper is a shell
+script). Linux GNU artifacts support glibc 2.30 and newer.
 
 Tagged releases also publish `@opencode-ai/pty` to npm with optional,
 platform-specific binary packages. Installing the npm package selects the native
-binary for the current platform and exposes its path as `binaryPath`:
+binary for the current platform (`opencode-pty.exe` on Windows) and exposes
+its path as `binaryPath`:
 
 ```js
 import { binaryPath } from "@opencode-ai/pty"
@@ -362,8 +365,7 @@ git tag v0.1.0
 push origin v0.1.0
 ```
 
-Release artifacts do not yet include Windows builds. Platform signing will be
-added later.
+Platform signing will be added later.
 
 ## Current Limits
 
