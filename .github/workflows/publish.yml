@@ -233,6 +233,8 @@ jobs:
   release:
     needs: [build, build-windows]
     runs-on: ubuntu-22.04
+    # Tag runs publish to npm and wait for approval in the release environment.
+    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
     permissions:
       contents: write
       id-token: write
