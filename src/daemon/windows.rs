@@ -58,7 +58,7 @@ pub(super) fn read_registration(directory: &Path) -> Result<Registration> {
 pub(super) struct Runtime {
     pub registration: Registration,
     pub cleanup: Cleanup,
-    sweeper: JoinHandle<()>,
+    sweeper: Option<JoinHandle<()>>,
     // Neither handle shares delete access, so the private directory and lock
     // cannot be replaced while the daemon runs.
     lock: File,
@@ -117,7 +117,13 @@ impl Runtime {
         write_registration(&directory, &directory_handle, &registration, &security)?;
         let sweeper = {
             let directory = directory.clone();
-            thread::spawn(move || sweep::stale_runtimes(&directory))
+            thread::Builder::new()
+                .name("opencode-pty-sweeper".to_string())
+                .spawn(move || sweep::stale_runtimes(&directory))
+                .inspect_err(|error| {
+                    eprintln!("opencode-pty could not start stale runtime sweeper: {error}");
+                })
+                .ok()
         };
         Ok((
             Self {
@@ -137,7 +143,9 @@ impl Runtime {
     /// Removes this daemon's runtime state after the server has joined its
     /// handlers. The caller keeps the pipe namespace until this returns.
     pub fn finish(self) -> Result<()> {
-        let _ = self.sweeper.join();
+        if let Some(sweeper) = self.sweeper {
+            let _ = sweeper.join();
+        }
         let result = self.cleanup.run();
         let directory = self.cleanup.directory;
         // The protected handles deny deletion; release them first. A daemon that

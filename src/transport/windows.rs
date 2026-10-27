@@ -276,10 +276,12 @@ impl Connection {
         };
         let cancellation = self.cancellation()?;
         let (sender, disconnected) = bounded(1);
-        let thread = thread::spawn(move || {
-            let _ = reader.read(&mut [0]);
-            let _ = sender.send(());
-        });
+        let thread = thread::Builder::new()
+            .name("opencode-pty-disconnect".to_string())
+            .spawn(move || {
+                let _ = reader.read(&mut [0]);
+                let _ = sender.send(());
+            })?;
         Ok(DisconnectMonitor {
             disconnected,
             cancellation,

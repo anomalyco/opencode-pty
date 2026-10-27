@@ -42,18 +42,26 @@ pub fn run(directory: &Path) -> Result<()> {
                     let shutdown = Arc::clone(&shutdown);
                     let ownership = Arc::clone(&ownership);
                     let registration = registration.clone();
-                    let handle = thread::spawn(move || {
-                        if let Err(error) = handle_connection(
-                            stream,
-                            &service,
-                            &registration,
-                            &shutdown,
-                            &ownership,
-                        ) {
-                            eprintln!("opencode-pty request failed: {error:#}");
+                    let spawned = thread::Builder::new()
+                        .name("opencode-pty-connection".to_string())
+                        .spawn(move || {
+                            if let Err(error) = handle_connection(
+                                stream,
+                                &service,
+                                &registration,
+                                &shutdown,
+                                &ownership,
+                            ) {
+                                eprintln!("opencode-pty request failed: {error:#}");
+                            }
+                        });
+                    // A failed spawn drops the connection, so the peer sees EOF.
+                    match spawned {
+                        Ok(handle) => handlers.push((control, handle)),
+                        Err(error) => {
+                            eprintln!("opencode-pty could not start connection handler: {error}");
                         }
-                    });
-                    handlers.push((control, handle));
+                    }
                 }
                 Ok(None) => {
                     thread::sleep(Duration::from_millis(10));
@@ -73,13 +81,19 @@ pub fn run(directory: &Path) -> Result<()> {
     }
     let (cleanup_tx, cleanup_rx) = crossbeam_channel::bounded::<()>(1);
     let cleanup = runtime.cleanup.clone();
-    let watchdog = thread::spawn(move || {
-        if cleanup_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-            eprintln!("opencode-pty cleanup timed out; forcing exit");
-            let _ = cleanup.run();
-            std::process::exit(1);
-        }
-    });
+    let watchdog = thread::Builder::new()
+        .name("opencode-pty-watchdog".to_string())
+        .spawn(move || {
+            if cleanup_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                eprintln!("opencode-pty cleanup timed out; forcing exit");
+                let _ = cleanup.run();
+                std::process::exit(1);
+            }
+        })
+        .inspect_err(|error| {
+            eprintln!("opencode-pty could not start cleanup watchdog: {error}");
+        })
+        .ok();
     service.shutdown();
     for (_, handler) in handlers {
         let _ = handler.join();
@@ -88,7 +102,9 @@ pub fn run(directory: &Path) -> Result<()> {
     let cleanup = runtime.finish();
     drop(listener);
     let _ = cleanup_tx.send(());
-    let _ = watchdog.join();
+    if let Some(watchdog) = watchdog {
+        let _ = watchdog.join();
+    }
     result.and(cleanup)
 }
 

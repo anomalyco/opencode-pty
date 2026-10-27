@@ -67,10 +67,12 @@ impl Connection {
         let mut reader = self.0.try_clone()?;
         let stream = self.0.try_clone()?;
         let (sender, disconnected) = bounded(1);
-        let thread = thread::spawn(move || {
-            let _ = reader.read(&mut [0_u8; 1]);
-            let _ = sender.send(());
-        });
+        let thread = thread::Builder::new()
+            .name("opencode-pty-disconnect".to_string())
+            .spawn(move || {
+                let _ = reader.read(&mut [0_u8; 1]);
+                let _ = sender.send(());
+            })?;
         Ok(DisconnectMonitor {
             stream,
             disconnected,

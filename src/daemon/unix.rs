@@ -16,7 +16,7 @@ use crate::transport::Listener;
 pub(super) struct Runtime {
     pub registration: Registration,
     pub cleanup: Cleanup,
-    sweeper: JoinHandle<()>,
+    sweeper: Option<JoinHandle<()>>,
     // Held until the shared server has joined its handlers and removed registration.
     lock: File,
 }
@@ -52,7 +52,13 @@ impl Runtime {
         write_registration(&directory, &registration)?;
         let sweeper = {
             let directory = directory.clone();
-            thread::spawn(move || super::sweep::stale_runtimes(&directory))
+            thread::Builder::new()
+                .name("opencode-pty-sweeper".to_string())
+                .spawn(move || super::sweep::stale_runtimes(&directory))
+                .inspect_err(|error| {
+                    eprintln!("opencode-pty could not start stale runtime sweeper: {error}");
+                })
+                .ok()
         };
         Ok((
             Self {
@@ -71,7 +77,9 @@ impl Runtime {
 
     /// Removes this daemon's runtime state after the server has joined its handlers.
     pub fn finish(self) -> Result<()> {
-        let _ = self.sweeper.join();
+        if let Some(sweeper) = self.sweeper {
+            let _ = sweeper.join();
+        }
         let result = self.cleanup.run();
         drop(self.lock);
         result

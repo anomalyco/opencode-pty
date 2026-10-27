@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
 use crate::ghostty::{Format, Terminal, TerminalOptions};
@@ -445,15 +445,6 @@ impl TerminalHandle {
             .with_context(|| format!("failed to spawn {}", request.program))?;
         let pid = child.process_id();
         let killer = child.clone_killer();
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
-        drop(pair.slave);
 
         let info = Arc::new(RwLock::new(TerminalInfo {
             id,
@@ -480,127 +471,164 @@ impl TerminalHandle {
         #[cfg(windows)]
         let (close_tx, close_rx) = bounded(1);
         let (init_tx, init_rx) = std_mpsc::sync_channel(1);
-
-        let actor_info = Arc::clone(&info);
-        let actor_writer_tx = writer_tx.clone();
-        let actor_shutdown = shutdown.clone();
+        // A failed waiter spawn must leave the child here to be reaped.
+        let (child_tx, child_rx) = std_mpsc::sync_channel::<Box<dyn Child + Send + Sync>>(1);
+        let mut child = Some(child);
         let (actor_done_tx, actor_done) = bounded::<()>(0);
-        let actor_thread = thread::Builder::new()
-            .name(format!("opencode-pty-actor-{id}"))
-            .spawn(move || {
-                let _actor_done = actor_done_tx;
-                let result = run_actor(ActorConfig {
-                    master: ActorMaster {
-                        pty: Some(pair.master),
-                        #[cfg(windows)]
-                        close_tx,
-                    },
-                    messages: actor_rx,
-                    writes: actor_writer_tx,
-                    shutdown: actor_shutdown,
-                    info: actor_info,
-                    replay_capacity,
-                    cols: request.cols,
-                    rows: request.rows,
-                    init_tx,
-                });
-                if let Err(error) = result {
-                    eprintln!("terminal {id} actor failed: {error:#}");
-                }
-            })
-            .context("failed to spawn terminal actor")?;
+        let mut joins = Vec::new();
 
-        match init_rx
-            .recv()
-            .context("terminal actor stopped during initialization")?
-        {
-            Ok(()) => {}
-            Err(error) => {
-                let mut killer = killer;
-                let _ = killer.kill();
-                let _ = actor_thread.join();
-                bail!(error);
-            }
-        }
+        let started = (|| -> Result<()> {
+            let mut reader = pair
+                .master
+                .try_clone_reader()
+                .context("failed to clone PTY reader")?;
+            let writer = pair
+                .master
+                .take_writer()
+                .context("failed to take PTY writer")?;
+            drop(pair.slave);
 
-        let writer_actor_tx = actor_tx.clone();
-        let writer_thread = thread::Builder::new()
-            .name(format!("opencode-pty-writer-{id}"))
-            .spawn(move || run_writer(writer, writer_rx, writer_actor_tx, shutdown))
-            .context("failed to spawn terminal writer")?;
-
-        let reader_actor_tx = actor_tx.clone();
-        let reader_thread = thread::Builder::new()
-            .name(format!("opencode-pty-reader-{id}"))
-            .spawn(move || {
-                let mut buffer = [0_u8; 8192];
-                let mut forwarding = true;
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => {
-                            let _ = reader_actor_tx.send(ActorMessage::ReaderEof);
-                            break;
-                        }
-                        Ok(length) => {
-                            if forwarding {
-                                forwarding = reader_actor_tx
-                                    .send(ActorMessage::Output(buffer[..length].to_vec()))
-                                    .is_ok();
+            // Start the reader and waiter before the actor, as in normal
+            // shutdown: if the actor fails, its master reaches the waiter and
+            // ConPTY closes while the reader drains output.
+            let reader_actor_tx = actor_tx.clone();
+            joins.push(
+                thread::Builder::new()
+                    .name(format!("opencode-pty-reader-{id}"))
+                    .spawn(move || {
+                        let mut buffer = [0_u8; 8192];
+                        let mut forwarding = true;
+                        loop {
+                            match reader.read(&mut buffer) {
+                                Ok(0) => {
+                                    let _ = reader_actor_tx.send(ActorMessage::ReaderEof);
+                                    break;
+                                }
+                                Ok(length) => {
+                                    if forwarding {
+                                        forwarding = reader_actor_tx
+                                            .send(ActorMessage::Output(buffer[..length].to_vec()))
+                                            .is_ok();
+                                        #[cfg(unix)]
+                                        if !forwarding {
+                                            break;
+                                        }
+                                    }
+                                    // On Windows, ClosePseudoConsole can wait for its
+                                    // output pipe to drain. Once the actor stops, keep
+                                    // this sole reader draining without forwarding.
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
                                 #[cfg(unix)]
-                                if !forwarding {
+                                Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                                    let _ = reader_actor_tx.send(ActorMessage::ReaderEof);
+                                    break;
+                                }
+                                Err(error) => {
+                                    let _ = reader_actor_tx
+                                        .send(ActorMessage::ReaderFailed(error.to_string()));
                                     break;
                                 }
                             }
-                            // On Windows, ClosePseudoConsole can wait for its
-                            // output pipe to drain. Once the actor stops, keep
-                            // this sole reader draining without forwarding.
                         }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    })
+                    .context("failed to spawn terminal reader")?,
+            );
+
+            let wait_actor_tx = actor_tx.clone();
+            joins.push(
+                thread::Builder::new()
+                    .name(format!("opencode-pty-wait-{id}"))
+                    .spawn(move || {
+                        let Ok(child) = child_rx.recv() else {
+                            return;
+                        };
+                        #[cfg(windows)]
+                        windows::wait_and_close(child, wait_actor_tx, close_rx);
                         #[cfg(unix)]
-                        Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                            let _ = reader_actor_tx.send(ActorMessage::ReaderEof);
-                            break;
+                        {
+                            let mut child = child;
+                            let result = child.wait().map(|status| Some(status.exit_code()));
+                            let _ = wait_actor_tx.send(ActorMessage::ChildExited(
+                                result.map_err(|error| error.to_string()),
+                            ));
                         }
-                        Err(error) => {
-                            let _ =
-                                reader_actor_tx.send(ActorMessage::ReaderFailed(error.to_string()));
-                            break;
+                    })
+                    .context("failed to spawn terminal child waiter")?,
+            );
+            if let Some(child) = child.take() {
+                let _ = child_tx.send(child);
+            }
+
+            let actor_info = Arc::clone(&info);
+            let actor_writer_tx = writer_tx.clone();
+            let actor_shutdown = shutdown.clone();
+            joins.push(
+                thread::Builder::new()
+                    .name(format!("opencode-pty-actor-{id}"))
+                    .spawn(move || {
+                        let _actor_done = actor_done_tx;
+                        let result = run_actor(ActorConfig {
+                            master: ActorMaster {
+                                pty: Some(pair.master),
+                                #[cfg(windows)]
+                                close_tx,
+                            },
+                            messages: actor_rx,
+                            writes: actor_writer_tx,
+                            shutdown: actor_shutdown,
+                            info: actor_info,
+                            replay_capacity,
+                            cols: request.cols,
+                            rows: request.rows,
+                            init_tx,
+                        });
+                        if let Err(error) = result {
+                            eprintln!("terminal {id} actor failed: {error:#}");
                         }
-                    }
-                }
-            })
-            .context("failed to spawn terminal reader")?;
+                    })
+                    .context("failed to spawn terminal actor")?,
+            );
 
-        let wait_actor_tx = actor_tx.clone();
-        let wait_thread = thread::Builder::new()
-            .name(format!("opencode-pty-wait-{id}"))
-            .spawn(move || {
-                #[cfg(windows)]
-                windows::wait_and_close(child, wait_actor_tx, close_rx);
-                #[cfg(unix)]
-                {
-                    let mut child = child;
-                    let result = child.wait().map(|status| Some(status.exit_code()));
-                    let _ = wait_actor_tx.send(ActorMessage::ChildExited(
-                        result.map_err(|error| error.to_string()),
-                    ));
-                }
-            })
-            .context("failed to spawn terminal child waiter")?;
+            match init_rx
+                .recv()
+                .context("terminal actor stopped during initialization")?
+            {
+                Ok(()) => {}
+                Err(error) => bail!(error),
+            }
 
-        Ok(Self {
+            let writer_actor_tx = actor_tx.clone();
+            joins.push(
+                thread::Builder::new()
+                    .name(format!("opencode-pty-writer-{id}"))
+                    .spawn(move || run_writer(writer, writer_rx, writer_actor_tx, shutdown))
+                    .context("failed to spawn terminal writer")?,
+            );
+
+            Ok(())
+        })();
+
+        let terminal = Self {
             actor_tx,
             actor_done,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             killer: Mutex::new(killer),
             info,
-            joins: Mutex::new(Some(vec![
-                actor_thread,
-                writer_thread,
-                reader_thread,
-                wait_thread,
-            ])),
-        })
+            joins: Mutex::new(Some(joins)),
+        };
+        if let Err(error) = started {
+            // Normal shutdown stops and joins whichever workers started. A
+            // started waiter reaps the child; otherwise it is still here.
+            let _ = terminal.shutdown();
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+            return Err(error);
+        }
+        Ok(terminal)
     }
 
     fn info(&self) -> TerminalInfo {
