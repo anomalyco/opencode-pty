@@ -88,7 +88,6 @@ jobs:
           key: windows-${{ matrix.target }}-zig-0.16.0
           # The native Ghostty build is now an output of the workspace crate.
           cache-workspace-crates: true
-          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --check
       - name: Check Clippy
