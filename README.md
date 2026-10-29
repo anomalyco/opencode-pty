@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This repository is no longer maintained.** opencode-pty has moved into the OpenCode monorepo at [anomalyco/opencode/packages/process-daemon](https://github.com/anomalyco/opencode/tree/dev/packages/process-daemon). New releases are published to npm as [`@opencode/pty`](https://www.npmjs.com/package/@opencode/pty) (replacing `@opencode-ai/pty`). Please open issues and pull requests in [anomalyco/opencode](https://github.com/anomalyco/opencode).
+
 # opencode-pty
 
 Experimental threaded PTY service core for OpenCode.
